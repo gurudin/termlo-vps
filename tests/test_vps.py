@@ -39,7 +39,8 @@ class InstallerTests(unittest.TestCase):
         self.events = self.home / "events"
         self.events.touch()
         env = patch.dict(os.environ, {"HOME": str(self.home), "XDG_CONFIG_HOME": str(self.home / "config"),
-                                      "PATH": str(self.bin), "EVENTS": str(self.events)}, clear=True)
+                                      "PATH": str(self.bin), "EVENTS": str(self.events),
+                                      "TERMLO_INSTALL_NETWORK": "global"}, clear=True)
         env.start()
         self.addCleanup(env.stop)
         platform = patch.object(sys, "platform", "linux")
@@ -115,6 +116,7 @@ case "$1" in
 esac''')
         command(self.bin / "apt-get", '''
 echo "apt $*" >> "$EVENTS"
+case " $* " in *" --download-only "*) exit 0 ;; esac
 if [ "$1" = install ]; then
     for tool in "$@"; do
         case "$tool" in
@@ -150,7 +152,7 @@ SH''')
         events = self.events.read_text()
         self.assertIn("tmux", events)
         self.assertEqual(events.count("claude\n"), 1)
-        self.assertEqual(events.count("pull\n"), 2)
+        self.assertEqual(events.count("pull\n"), 3)
         self.assertEqual(self.install(sync_only=False, host=None, port=None, host_key=None, name=None), code)
         self.assertEqual(self.events.read_text(), events)
 
@@ -168,7 +170,12 @@ SH''')
         with patch.dict(os.environ, SSH_CONNECTION="10.0.0.1 50000 2606:4700:4700::1111 2200"):
             result = self.wizard_install("\n\n\n2\n")
         self.assertEqual((result["host"], result["port"]), ("2606:4700:4700::1111", 2200))
-        self.assertEqual(self.events.read_text().splitlines(), ["apt update", "apt install -y --no-install-recommends tmux"])
+        operations = self.events.read_text().splitlines()
+        self.assertEqual(len(operations), 3)
+        self.assertTrue(operations[0].startswith("apt update "))
+        self.assertIn(" --download-only ", operations[1])
+        self.assertIn(" --no-download ", operations[2])
+        self.assertTrue(all(op.endswith(" tmux") for op in operations[1:]))
         with patch.object(wizard, "suggest_host", side_effect=AssertionError("should reuse saved address")):
             self.assertEqual(self.wizard_install("\n\n2\n"), result)
 
@@ -188,6 +195,18 @@ SH''')
             self.assertIn("登录浏览器 安装失败", messages.read())
         self.assertEqual(result["host"], "dev.example.org")
         self.assertIn("pull", self.events.read_text().splitlines())
+
+    def test_china_claude_is_optional_and_uses_only_the_official_installer(self):
+        self.prepare_fake_linux_tools()
+        command(self.bin / "curl", 'for url do :; done; echo "$url" >> "$EVENTS"; exit 7')
+        with patch.dict(os.environ, TERMLO_INSTALL_NETWORK="cn"), \
+             patch.object(wizard, "suggest_host", return_value=("dev.example.org", "当前 SSH 会话")), \
+             patch.object(termlo, "SYSTEM_CA_BUNDLE", self.key):
+            defaults = self.wizard_install("\n\n2\n\n")
+            self.assertEqual(self.events.read_text(), "")
+            explicit = self.wizard_install("\n\n2\n1\n\n")
+        self.assertEqual(defaults, explicit)
+        self.assertEqual(self.events.read_text().splitlines(), ["https://claude.ai/install.sh"])
 
     def test_wizard_cancel_preserves_saved_config(self):
         original = self.install()

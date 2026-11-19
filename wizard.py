@@ -2,6 +2,7 @@
 
 import http.client
 import ipaddress
+import json
 import shutil
 import subprocess
 import sys
@@ -35,25 +36,30 @@ def local_addresses():
     return addresses
 
 
-def public_egress_address():
-    try:
-        with urllib.request.urlopen("https://api64.ipify.org", timeout=3) as response:
-            address = ipaddress.ip_address(response.read(64).decode("ascii").strip())
-        if address.is_global and usable_address(address):
-            return str(address)
-    except (OSError, ValueError, http.client.HTTPException):
-        pass
+def public_egress_address(region="global"):
+    domestic = "https://myip.ipip.net/json"
+    international = "https://api64.ipify.org"
+    for url in ((domestic, international) if region == "cn" else (international, domestic)):
+        try:
+            with urllib.request.urlopen(url, timeout=3) as response:
+                body = response.read(2048)
+            value = json.loads(body)["data"]["ip"] if url == domestic else body.decode("ascii").strip()
+            address = ipaddress.ip_address(value)
+            if address.is_global and usable_address(address):
+                return str(address)
+        except (OSError, ValueError, KeyError, TypeError, http.client.HTTPException):
+            continue
     return None
 
 
-def suggest_host(ssh_address):
+def suggest_host(ssh_address, region="global", egress=None):
     if ssh_address and ssh_address.is_global and usable_address(ssh_address):
         return str(ssh_address), "当前 SSH 会话"
     addresses = local_addresses()
     for address in addresses:
         if address.is_global:
             return str(address), "本机公网地址"
-    external = public_egress_address()
+    external = egress or public_egress_address(region)
     if external:
         return external, "检测到的公网出口，使用转发时请核对"
     if ssh_address and usable_address(ssh_address):

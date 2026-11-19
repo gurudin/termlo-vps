@@ -15,7 +15,11 @@ import time
 import uuid
 
 
-IMAGE = "lscr.io/linuxserver/chromium:latest"
+# LinuxServer release 075b0b99-ls64, multi-architecture index on Docker Hub and GHCR.
+IMAGE_DIGEST = "sha256:6d2a8da6a45d4083a7287211a619ca29fdb518ebea0ef562c27392ba2f6698d2"
+IMAGE = "lscr.io/linuxserver/chromium@" + IMAGE_DIGEST
+CN_IMAGE = "docker.m.daocloud.io/linuxserver/chromium@" + IMAGE_DIGEST
+LEGACY_IMAGE = "lscr.io/linuxserver/chromium:latest"
 LABEL = "io.termlo.login"
 
 
@@ -54,15 +58,22 @@ def require_engine():
     return engine
 
 
-def has_image(engine):
-    return subprocess.run([engine, "image", "inspect", IMAGE], stdout=subprocess.DEVNULL,
-                          stderr=subprocess.DEVNULL).returncode == 0
+def local_image(engine):
+    for image in (IMAGE, CN_IMAGE, LEGACY_IMAGE):
+        if subprocess.run([engine, "image", "inspect", image], stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL).returncode == 0:
+            return image
+    return None
 
 
-def prepare_image(engine):
-    if not has_image(engine):
-        print("正在下载登录用 Chromium 镜像，首次下载可能需要几分钟…", file=sys.stderr, flush=True)
-        subprocess.run([engine, "pull", IMAGE], stdout=sys.stderr, check=True)
+def prepare_image(engine, region):
+    if local_image(engine):
+        return
+    first, fallback = (CN_IMAGE, IMAGE) if region == "cn" else (IMAGE, CN_IMAGE)
+    print(f"正在从 {first.split('/')[0]} 下载 Chromium 镜像…", file=sys.stderr, flush=True)
+    if subprocess.run([engine, "pull", first], stdout=sys.stderr).returncode:
+        print(f"下载失败，改从 {fallback.split('/')[0]} 获取同一镜像。", file=sys.stderr, flush=True)
+        subprocess.run([engine, "pull", fallback], stdout=sys.stderr, check=True)
 
 
 def inspect_container(engine, name, owner):
@@ -135,13 +146,14 @@ def manage(action, session, folder):
             container = None
         created = None
         if not container:
-            if not has_image(engine):
+            image = local_image(engine)
+            if not image:
                 raise ValueError("尚未准备 Chromium 镜像。请在 VPS 安装向导中选择「Claude 登录浏览器」。")
             # The legacy client forwards port 3001. Named sessions each get a free loopback port.
             publish = "127.0.0.1::3001" if session else "127.0.0.1:3001:3001"
             result = subprocess.run([engine, "run", "-d", "--rm", "--pull=never", "--name", name,
                                      "--label", f"{LABEL}={owner}", "-p", publish, "--shm-size=1g",
-                                     "-e", "CUSTOM_USER=termlo", "-e", "PASSWORD", IMAGE],
+                                     "-e", "CUSTOM_USER=termlo", "-e", "PASSWORD", image],
                                     env=dict(os.environ, PASSWORD=secrets.token_urlsafe(24)),
                                     stdout=subprocess.PIPE, text=True, check=True)
             created = result.stdout.strip()

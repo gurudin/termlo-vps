@@ -6,6 +6,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import pkgutil
 import pwd
 import shutil
 import subprocess
@@ -59,7 +60,7 @@ def system_host_key(address, port):
     return keys[0]
 
 
-def connection_settings(args, terminal=None):
+def connection_settings(args, terminal=None, region="global", egress=None):
     path = config_dir() / "connection.json"
     saved = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
     address, internal_port = ssh_endpoint()
@@ -69,7 +70,7 @@ def connection_settings(args, terminal=None):
     if terminal is not None:
         note(f"\n1/3  确认 SSH 连接\n登录用户  {user}    按回车接受方括号中的默认值。")
         if host is None:
-            host, source = wizard.suggest_host(address)
+            host, source = wizard.suggest_host(address, region, egress)
         else:
             source = "指定地址" if args.host is not None else "上次使用的地址"
         host = wizard.ask_field(terminal, f"服务器地址（{source}）", host, wizard.ssh_host)
@@ -83,22 +84,41 @@ def connection_settings(args, terminal=None):
                 name=args.name if args.name is not None else saved.get("name"))
 
 
+def run_sources(*args, stdout):
+    # The same Bash helper bootstraps Python and travels inside the installed zipapp.
+    return subprocess.run(["bash", "-s", "--", *args], input=pkgutil.get_data("termlo", "sources.sh"),
+                          stdout=stdout, check=True)
+
+
+def install_network():
+    hint = os.environ.get("TERMLO_INSTALL_NETWORK")
+    if not hint:
+        hint = run_sources("detect", stdout=subprocess.PIPE).stdout.decode("utf-8", "replace")
+    parts = hint.split()
+    region = parts[0] if parts and parts[0] in ("cn", "global") else "auto"
+    egress = None
+    if len(parts) == 2:
+        try:
+            address = ipaddress.ip_address(parts[1])
+            if address.is_global and wizard.usable_address(address):
+                egress = str(address)
+        except ValueError:
+            pass
+    return region, egress
+
+
 class SystemPackages:
-    def __init__(self):
-        self.index_ready = False
+    def __init__(self, region, state):
+        self.region = region
+        self.state = state
 
     def install(self, packages):
         if not packages:
             return
         if not shutil.which("apt-get") or (os.getuid() != 0 and not shutil.which("sudo")):
             raise ValueError("请先用系统包管理器安装 " + "、".join(packages) + "，再重试。")
-        prefix = [] if os.getuid() == 0 else ["sudo"]
         note("正在安装系统包 " + "、".join(packages))
-        if not self.index_ready:
-            subprocess.run(prefix + ["apt-get", "update"], stdout=sys.stderr, check=True)
-            self.index_ready = True
-        subprocess.run(prefix + ["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y",
-                                  "--no-install-recommends", *packages], stdout=sys.stderr, check=True)
+        run_sources("apt", self.region, self.state, *packages, stdout=sys.stderr)
 
 
 def ensure_tmux(packages):
@@ -117,7 +137,8 @@ def ensure_claude(packages):
         with tempfile.TemporaryDirectory() as folder:
             script = Path(folder) / "install-claude.sh"
             subprocess.run(["curl", "--proto", "=https", "--proto-redir", "=https", "-fsSL",
-                            "--retry", "2", "-o", str(script), "https://claude.ai/install.sh"], check=True)
+                            "--connect-timeout", "5", "--max-time", "45", "--retry", "2",
+                            "-o", str(script), "https://claude.ai/install.sh"], check=True)
             subprocess.run(["bash", str(script), "stable"], stdout=sys.stderr, check=True)
     subprocess.run(["claude", "--version"], stdout=sys.stderr, check=True)
 
@@ -126,7 +147,7 @@ def ensure_browser(packages):
     engine = browser.available_engine()
     if not engine:
         packages.install(["podman", "uidmap", "slirp4netns", "fuse-overlayfs"])
-    browser.prepare_image(engine or browser.require_engine())
+    browser.prepare_image(engine or browser.require_engine(), packages.region)
 
 
 def run_optional(terminal, title, description, present, action, default=1):
@@ -150,12 +171,15 @@ def select_tools(terminal, packages):
     note("\n2/3  选择开发工具\nSSH 连接和代码同步可以独立使用。")
     run_optional(terminal, "tmux", "断开 SSH 后保留终端会话。",
                  shutil.which("tmux"), lambda: ensure_tmux(packages))
-    has_claude = run_optional(terminal, "Claude Code", "在 VPS 上运行 Claude Code，使用官方稳定版。",
-                              shutil.which("claude"), lambda: ensure_claude(packages))
+    mainland = packages.region == "cn"
+    description = ("官方服务尚未支持中国大陆，默认跳过。选装将访问 Anthropic 官方源。" if mainland
+                   else "在 VPS 上运行 Claude Code，使用官方稳定版。")
+    has_claude = run_optional(terminal, "Claude Code", description, shutil.which("claude"),
+                              lambda: ensure_claude(packages), default=2 if mainland else 1)
     if has_claude:
         engine = browser.available_engine()
         run_optional(terminal, "Claude 登录浏览器", "供 Mac 打开远端网页登录，需要容器运行时和 Chromium 镜像。",
-                     engine and browser.has_image(engine), lambda: ensure_browser(packages), default=2)
+                     engine and browser.local_image(engine), lambda: ensure_browser(packages), default=2)
 
 
 def install_cli():
@@ -169,8 +193,8 @@ def install_cli():
         else:
             with stage.open("wb") as output:
                 output.write(b"#!/usr/bin/env python3\n")
-                with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as bundle:
-                    for name in ("termlo.py", "connection_code.py", "browser.py", "wizard.py"):
+                with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED, strict_timestamps=False) as bundle:
+                    for name in ("termlo.py", "connection_code.py", "browser.py", "wizard.py", "sources.sh"):
                         bundle.write(Path(__file__).with_name(name), name)
                     bundle.writestr("__main__.py", "from termlo import main\nmain()\n")
         stage.chmod(0o755)
@@ -188,12 +212,16 @@ def install(args, terminal=None):
     os.environ["PATH"] = f"{Path.home()}/.local/bin:{Path.home()}/.npm-global/bin:" + os.environ["PATH"]
     folder = config_dir()
     folder.mkdir(mode=0o700, parents=True, exist_ok=True)
-    packages = SystemPackages()
-    with (folder / "install.lock").open("a") as lock:
+    with (folder / "install.lock").open("a") as lock, tempfile.TemporaryDirectory(prefix="termlo-apt-") as state:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        region, egress = install_network()
+        channels = {"cn": "中国大陆，优先使用国内镜像", "global": "海外，优先使用系统源和官方镜像",
+                    "auto": "未识别到出口地区，优先使用系统源，下载失败时尝试国内镜像"}
+        note("下载线路：" + channels[region])
+        packages = SystemPackages(region, state)
         if not shutil.which("ssh-keygen") or not shutil.which("scp"):
             packages.install(["openssh-client"])
-        settings = connection_settings(args, terminal)
+        settings = connection_settings(args, terminal, region, egress)
         code = make_code(**settings)
         if terminal is not None:
             select_tools(terminal, packages)
