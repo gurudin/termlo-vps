@@ -15,8 +15,9 @@ import tempfile
 import zipfile
 
 import browser
+import pairing
 import wizard
-from connection_code import make_code
+from connection_code import connection_details, encode
 
 
 SYSTEM_CA_BUNDLE = Path("/etc/ssl/certs/ca-certificates.crt")
@@ -194,7 +195,7 @@ def install_cli():
             with stage.open("wb") as output:
                 output.write(b"#!/usr/bin/env python3\n")
                 with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED, strict_timestamps=False) as bundle:
-                    for name in ("termlo.py", "connection_code.py", "browser.py", "wizard.py", "sources.sh"):
+                    for name in ("termlo.py", "connection_code.py", "pairing.py", "browser.py", "wizard.py", "sources.sh"):
                         bundle.write(Path(__file__).with_name(name), name)
                     bundle.writestr("__main__.py", "from termlo import main\nmain()\n")
         stage.chmod(0o755)
@@ -222,7 +223,7 @@ def install(args, terminal=None):
         if not shutil.which("ssh-keygen") or not shutil.which("scp"):
             packages.install(["openssh-client"])
         settings = connection_settings(args, terminal, region, egress)
-        code = make_code(**settings)
+        details = connection_details(**settings, include_host_key=True)
         if terminal is not None:
             select_tools(terminal, packages)
         elif not args.sync_only:
@@ -236,9 +237,11 @@ def install(args, terminal=None):
         with tempfile.NamedTemporaryFile(dir=folder, mode="w", encoding="utf-8", delete=False) as out:
             json.dump(settings, out, ensure_ascii=False)
         os.replace(out.name, folder / "connection.json")
+        code = encode(dict(details, version=2, pairing=pairing.issue()))
     if terminal is not None:
         note("\n3/3  复制连接码")
-    note("安装完成。将下面一整行粘贴到 Mac 端「服务器 → 添加服务器 → 连接码」。")
+    note("安装完成。将下面一整行粘贴到 Mac 的「添加服务器」，点「连接」。")
+    note("连接码在 10 分钟内有效，可绑定一台 Mac。以后在这台 Mac 上点服务器名称即可连接。")
     print(code)
 
 
@@ -255,7 +258,9 @@ def main():
     setup = commands.add_parser("install", help="安装或更新当前用户的 VPS 开发环境")
     add_endpoint_options(setup)
     setup.add_argument("--sync-only", action="store_true", help="仅准备 SSH 和代码同步")
-    add_endpoint_options(commands.add_parser("connection-code", help="重新输出本机连接码"))
+    add_endpoint_options(commands.add_parser("connection-code", help="生成可绑定一台 Mac 的新连接码"))
+    redeem = commands.add_parser("redeem", help=argparse.SUPPRESS)
+    redeem.add_argument("ticket")
     login = commands.add_parser("browser", help="临时打开或关闭 Claude 登录浏览器")
     login.add_argument("action", choices=["start", "stop"])
     login.add_argument("--session", type=browser.session_id, help="由 Mac 客户端分配的会话 UUID")
@@ -271,7 +276,10 @@ def main():
         elif args.command == "install":
             install(args)
         elif args.command == "connection-code":
-            print(make_code(**connection_settings(args)))
+            details = connection_details(**connection_settings(args), include_host_key=True)
+            print(encode(dict(details, version=2, pairing=pairing.issue())))
+        elif args.command == "redeem":
+            print(pairing.redeem(args.ticket, os.environ.get("SSH_ORIGINAL_COMMAND", "")))
         else:
             browser.manage(args.action, args.session, config_dir())
     except (EOFError, KeyboardInterrupt):

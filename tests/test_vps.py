@@ -62,16 +62,23 @@ class InstallerTests(unittest.TestCase):
     def decode(self, code):
         self.assertTrue(code.startswith("termlo://connect/"))
         payload = code.strip().split("/")[-1]
-        return json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        fields = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        ticket = fields.pop("pairing")
+        self.assertTrue(ticket["key"].startswith("-----BEGIN OPENSSH PRIVATE KEY-----"))
+        self.assertGreater(ticket["expiresAt"], 0)
+        return fields
 
     def test_sync_only_reprint_and_rotation(self):
         code = self.install()
         pin = subprocess.check_output(["ssh-keygen", "-E", "sha256", "-lf", self.public], text=True).split()[1]
-        self.assertEqual(self.decode(code), dict(version=1, host="dev.example.org", port=2207,
-                         user=termlo.pwd.getpwuid(os.getuid()).pw_name, name="开发机", fingerprint=pin))
+        self.assertEqual(self.decode(code), dict(version=2, host="dev.example.org", port=2207,
+                         user=termlo.pwd.getpwuid(os.getuid()).pw_name, name="开发机", fingerprint=pin,
+                         hostKey=" ".join(Path(self.public).read_text().split()[:2])))
         reprint = [str(self.cli), "connection-code"]
-        self.assertEqual(subprocess.check_output(reprint, text=True).strip(), code)
-        self.assertEqual(self.install(host=None, port=None, host_key=None, name=None), code)
+        fresh = subprocess.check_output(reprint, text=True).strip()
+        self.assertFalse(fresh == code, "Each invitation must be unique")
+        self.assertEqual(self.decode(fresh), self.decode(code))
+        self.assertEqual(self.decode(self.install(host=None, port=None, host_key=None, name=None)), self.decode(code))
         self.key.unlink()
         Path(self.public).unlink()
         subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(self.key)], check=True)
@@ -91,7 +98,7 @@ class InstallerTests(unittest.TestCase):
         for override in [dict(host_key=str(self.key)), dict(port=65536), dict(host="dev.example.org:2207")]:
             with self.assertRaises(ValueError):
                 self.install(**override)
-        self.assertEqual(subprocess.check_output([str(self.cli), "connection-code"], text=True).strip(), code)
+        self.assertEqual(self.decode(subprocess.check_output([str(self.cli), "connection-code"], text=True)), self.decode(code))
 
     def test_default_pin_uses_a_local_key_actually_offered_by_sshd(self):
         offered = self.home / "ssh_host_ecdsa_key"
@@ -153,7 +160,7 @@ SH''')
         self.assertIn("tmux", events)
         self.assertEqual(events.count("claude\n"), 1)
         self.assertEqual(events.count("pull\n"), 3)
-        self.assertEqual(self.install(sync_only=False, host=None, port=None, host_key=None, name=None), code)
+        self.assertEqual(self.decode(self.install(sync_only=False, host=None, port=None, host_key=None, name=None)), self.decode(code))
         self.assertEqual(self.events.read_text(), events)
 
     def wizard_install(self, answers):
@@ -212,7 +219,7 @@ SH''')
         original = self.install()
         with self.assertRaises(EOFError):
             self.wizard_install("other.example.org\n")
-        self.assertEqual(subprocess.check_output([str(self.cli), "connection-code"], text=True).strip(), original)
+        self.assertEqual(self.decode(subprocess.check_output([str(self.cli), "connection-code"], text=True)), self.decode(original))
 
 
 class HostDetectionTests(unittest.TestCase):

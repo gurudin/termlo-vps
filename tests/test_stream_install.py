@@ -18,6 +18,12 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 
+def endpoint(code):
+    payload = code.strip().split("/")[-1]
+    server = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    del server["pairing"]
+    return server
+
 
 class StreamInstallTests(unittest.TestCase):
     def setUp(self):
@@ -98,12 +104,12 @@ esac
         self.assertIn("3/3", transcript)
         codes = [line for line in transcript.splitlines() if line.startswith("termlo://connect/")]
         self.assertEqual(len(codes), 1, transcript)
-        payload = codes[0].split("/")[-1]
-        server = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        server = endpoint(codes[0])
+        self.assertEqual(server["version"], 2)
         self.assertEqual((server["host"], server["port"]), ("2606:4700:4700::1111", 2202))
         cli = str(self.home / ".local/bin/termlo")
-        self.assertEqual(subprocess.check_output([cli, "connection-code"], env=self.env, text=True).strip(), codes[0])
-        return codes[0]
+        self.assertEqual(endpoint(subprocess.check_output([cli, "connection-code"], env=self.env, text=True)), server)
+        return server
 
     def test_curl_pipe_reads_answers_from_terminal_and_emits_real_code(self):
         self.run_wizard(["-o", "pipefail", "-c", 'curl -fsSL "$1" | bash',
@@ -119,7 +125,7 @@ esac
         result = subprocess.run([cli, "install", "--sync-only"], env=self.env, text=True,
                                 capture_output=True, check=True)
         self.assertIn("未识别到出口地区", result.stderr)
-        self.assertEqual(result.stdout.strip(), code)
+        self.assertEqual(endpoint(result.stdout), code)
 
     def test_published_entry_points_match_the_built_bundle(self):
         self.assertEqual((ROOT / "install.sh").read_bytes(), (ROOT / "dist/termlo-install.sh").read_bytes())

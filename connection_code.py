@@ -27,7 +27,7 @@ def validate_host(host):
     return host
 
 
-def make_code(host, port, user, host_key, name=None):
+def connection_details(host, port, user, host_key, name=None, include_host_key=False):
     validate_host(host)
     if not 1 <= port <= 65535 or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*\$?", user):
         raise ValueError("请核对 SSH 端口和用户名")
@@ -44,9 +44,16 @@ def make_code(host, port, user, host_key, name=None):
     if result.returncode or len(fields) < 2 or not re.fullmatch(r"SHA256:[A-Za-z0-9+/]{43}", fields[1]):
         raise ValueError(f"无法计算 SSH 主机公钥 {host_key} 的指纹")
     payload = dict(version=1, host=host, port=port, user=user, fingerprint=fields[1])
+    if include_host_key:
+        payload["hostKey"] = " ".join(public_key.split()[:2])
     if name is not None:
         payload["name"] = name
-    return encode(payload)
+    return payload
+
+
+def make_code(host, port, user, host_key, name=None):
+    """Build a metadata-only v1 code for existing integrations."""
+    return encode(connection_details(host, port, user, host_key, name))
 
 
 def main():

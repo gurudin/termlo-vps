@@ -1,6 +1,6 @@
 # Termlo VPS 端
 
-在 Ubuntu 22.04 及以上或 Debian 12 及以上的 VPS 上，以将来从 Termlo 登录的 SSH 账号运行安装器。先确认 Mac 能用密钥登录这个账号。首次从云控制台准备 VPS 时，可以通过云厂商的 SSH 密钥管理添加 Mac 公钥。
+在 Ubuntu 22.04 及以上或 Debian 12 及以上的 VPS 上，打开云控制台或现有 SSH 终端，以将来要使用的账号运行安装器。第一次使用 Termlo 的 Mac 可以直接用安装器生成的连接码绑定。
 
 ## 安装和连接
 
@@ -20,7 +20,7 @@ bash install.sh
 
 1. **确认地址和端口。** 向导显示建议值，回车采用，也可以直接修改。地址优先使用上次的配置或当前 SSH 会话的公网地址。只有内网地址时，也会尝试从网卡或公网出口推断。如果经过端口映射，请确认显示的是 Mac 平时连接的地址和对外端口。登录用户和 SSH 主机指纹自动读取。
 2. **选择工具。** tmux 和 Claude Code 各自显示安装状态。已有的直接复用，缺少的选「现在安装」或「跳过」。两项都跳过也能连接 VPS 和同步代码。有 Claude Code 时还可以选择准备远程登录浏览器，该选项默认跳过。
-3. **复制连接码。** 安装完成后，将最后一行粘贴到 Mac 端。以后重新运行同一个向导，就能修改地址或补装工具。
+3. **连接这台 Mac。** 安装完成后，将最后一行粘贴到 Mac 的「服务器 → 添加服务器」，点「连接」进入终端。连接码在 10 分钟内有效，可授权一台 Mac 访问当前账号。请只交给要绑定的设备。
 
 ## 自动选源
 
@@ -38,7 +38,7 @@ Claude 的服务可用地区以 Anthropic 公布的范围为准。[官方支持�
 
 ## 在 Mac 上连接
 
-在 Mac 的「服务器 → 添加服务器 → 连接码」粘贴 `termlo://connect/…` 并测试连接。选择工作区的本地工程、这台 VPS 和远端目录，把同步方式选为「双向同步」后连接。Mac 需要能找到 Mutagen，可在设置里选择已有的程序。它经 SSH 传送并运行远端同步代理。[Mutagen SSH 文档](https://mutagen.io/documentation/transports/ssh/)
+首次绑定完成后，直接点击服务器名称即可再次连接，重启 Mac 或 Termlo 后也一样。想同步工程时，在工作区选择本地工程、这台 VPS 和远端目录，把同步方式选为「双向同步」后连接。Mac 需要能找到 Mutagen，可在设置里选择已有的程序。它经 SSH 传送并运行远端同步代理。[Mutagen SSH 文档](https://mutagen.io/documentation/transports/ssh/)
 
 Mac 上首次安装 Mutagen 可以使用 Homebrew。[Mutagen 安装文档](https://mutagen.io/documentation/introduction/installation/)
 
@@ -46,7 +46,7 @@ Mac 上首次安装 Mutagen 可以使用 Homebrew。[Mutagen 安装文档](https
 brew install mutagen-io/mutagen/mutagen
 ```
 
-以后只需重新输出连接码时，在 VPS 上运行下面的命令。指纹每次从本机公钥读取。
+连接码过期，或要绑定另一台 Mac 时，在 VPS 上运行下面的命令生成新码。已绑定的设备仍可重连。
 
 ```sh
 ~/.local/bin/termlo connection-code
