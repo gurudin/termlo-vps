@@ -41,6 +41,11 @@ usable_python() {
     fi
     python3 -B -c 'import sys; sys.exit(sys.version_info < (3, 8))' >/dev/null 2>&1
 }
+if [[ ${1:-} == uninstall || ${1:-} == --uninstall ]]; then
+    shift
+    usable_python || { echo "卸载需要可运行的 Python 3.8 或更高版本。" >&2; exit 1; }
+    exec python3 -B "$source_dir/termlo.py" uninstall "$@"
+fi
 if ! usable_python; then
     if [[ $system == Darwin ]]; then
         bash "$source_dir/sources.sh" brew formula python >&2

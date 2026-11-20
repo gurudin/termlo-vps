@@ -18,6 +18,7 @@ import browser
 import native_browser
 import pairing
 import sync_agent
+import uninstall
 import wizard
 from connection_code import connection_details, encode
 
@@ -112,23 +113,33 @@ def install_network():
 
 
 class SystemPackages:
-    def __init__(self, region, state):
+    def __init__(self, region, state, receipt):
         self.region = region
         self.state = state
+        self.receipt = receipt
 
     def install(self, packages):
         if not packages:
             return
         note("正在安装系统包 " + "、".join(packages))
         if sys.platform == "darwin":
-            run_sources("brew", "formula", *packages, stdout=sys.stderr)
+            with self.receipt.observe_packages("formula", packages):
+                run_sources("brew", "formula", *packages, stdout=sys.stderr)
             return
         if not shutil.which("apt-get") or (os.getuid() != 0 and not shutil.which("sudo")):
             raise ValueError("请先用系统包管理器安装 " + "、".join(packages) + "，再重试。")
-        run_sources("apt", self.region, self.state, *packages, stdout=sys.stderr)
+        with self.receipt.observe_packages("apt", packages):
+            run_sources("apt", self.region, self.state, *packages, stdout=sys.stderr)
 
     def cask(self, name):
-        run_sources("brew", "cask", name, stdout=sys.stderr)
+        with self.receipt.observe_packages("cask", [name]):
+            run_sources("brew", "cask", name, stdout=sys.stderr)
+
+    def install_chromium_snap(self):
+        privilege = [] if os.getuid() == 0 else ["sudo"]
+        subprocess.run([*privilege, "snap", "wait", "system", "seed.loaded"], timeout=240, check=True)
+        with self.receipt.observe_packages("snap", ["chromium"]):
+            subprocess.run([*privilege, "snap", "install", "chromium"], check=True)
 
 
 def claude_available():
@@ -153,7 +164,8 @@ def ensure_claude(packages):
             subprocess.run(["curl", "--proto", "=https", "--proto-redir", "=https", "-fsSL",
                             "--connect-timeout", "5", "--max-time", "45", "--retry", "2",
                             "-o", str(script), "https://claude.ai/install.sh"], check=True)
-            subprocess.run(["bash", str(script), "stable"], stdout=sys.stderr, check=True)
+            with packages.receipt.observe_claude():
+                subprocess.run(["bash", str(script), "stable"], stdout=sys.stderr, check=True)
     subprocess.run(["claude", "--version"], stdout=sys.stderr, check=True)
 
 
@@ -169,14 +181,15 @@ def ensure_browser(packages):
             if not shutil.which("snap"):
                 packages.install(["snapd"])
             if subprocess.run(["snap", "list", "chromium"], capture_output=True).returncode:
-                privilege = [] if os.getuid() == 0 else ["sudo"]
-                subprocess.run([*privilege, "snap", "wait", "system", "seed.loaded"], timeout=240, check=True)
-                subprocess.run([*privilege, "snap", "install", "chromium"], check=True)
+                packages.install_chromium_snap()
         elif not path:
             packages.install(["chromium", "chromium-sandbox"])
     if sys.platform == "linux" and os.geteuid() == 0:
         note("Chromium 将使用独立的非登录账号 termlo-browser 运行。SSH 仍绑定当前账号。")
-    path = native_browser.check(prepare_root=True)
+        with packages.receipt.observe_browser_user():
+            path = native_browser.check(prepare_root=True)
+    else:
+        path = native_browser.check(prepare_root=True)
     note(f"远程浏览器就绪，已在临时配置中启动并渲染测试页：{path}")
 
 
@@ -231,7 +244,7 @@ def install_cli():
                 output.write(b"#!/usr/bin/env python3\n")
                 with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED, strict_timestamps=False) as bundle:
                     for name in ("termlo.py", "connection_code.py", "pairing.py", "browser.py", "native_browser.py",
-                                 "sync_agent.py", "wizard.py", "sources.sh"):
+                                 "sync_agent.py", "uninstall.py", "wizard.py", "sources.sh"):
                         bundle.write(Path(__file__).with_name(name), name)
                     bundle.writestr("__main__.py", "from termlo import main\nmain()\n")
         stage.chmod(0o755)
@@ -241,6 +254,12 @@ def install_cli():
             stage.unlink()
 
 
+def add_tool_paths():
+    os.environ["PATH"] = f"{Path.home()}/.local/bin:{Path.home()}/.npm-global/bin:" + os.environ["PATH"]
+    if sys.platform == "darwin":
+        os.environ["PATH"] += ":/opt/homebrew/bin:/usr/local/bin"
+
+
 def install(args, terminal=None):
     if sys.platform not in ("linux", "darwin"):
         raise ValueError("请在远程 macOS 或 Linux 设备上安装 Termlo。")
@@ -248,9 +267,7 @@ def install(args, terminal=None):
         raise ValueError("请用平时连接远程 Mac 的普通账号运行安装器。")
     if os.getuid() == 0 and os.environ.get("SUDO_USER") not in (None, "", "root"):
         raise ValueError("请用目标 SSH 账号直接运行安装器，安装系统包时会自动调用 sudo。")
-    os.environ["PATH"] = f"{Path.home()}/.local/bin:{Path.home()}/.npm-global/bin:" + os.environ["PATH"]
-    if sys.platform == "darwin":
-        os.environ["PATH"] += ":/opt/homebrew/bin:/usr/local/bin"
+    add_tool_paths()
     folder = config_dir()
     folder.mkdir(mode=0o700, parents=True, exist_ok=True)
     with (folder / "install.lock").open("a") as lock, tempfile.TemporaryDirectory(prefix="termlo-apt-") as state:
@@ -259,7 +276,9 @@ def install(args, terminal=None):
         channels = {"cn": "中国大陆，APT 优先使用国内镜像", "global": "海外，优先使用系统源和官方源",
                     "auto": "未识别到出口地区，优先使用系统源"}
         note("下载线路：" + channels[region])
-        packages = SystemPackages(region, state)
+        receipt = uninstall.Receipt(folder)
+        receipt.save()
+        packages = SystemPackages(region, state, receipt)
         if any(not shutil.which(tool) for tool in ("ssh", "scp", "ssh-keygen")):
             packages.install(["openssh" if sys.platform == "darwin" else "openssh-client"])
         settings = connection_settings(args, terminal, region, egress)
@@ -270,7 +289,7 @@ def install(args, terminal=None):
         if sys.platform == "linux" and not SYSTEM_CA_BUNDLE.is_file():
             packages.install(["ca-certificates"])
         note(f"正在准备 Mutagen {sync_agent.VERSION} 远端同步代理…")
-        agent = sync_agent.install()
+        agent = receipt.install_agent()
         note(f"双向同步的远端代理已就绪：{agent}")
         if not args.sync_only:
             ensure_base_tools(packages)
@@ -285,6 +304,7 @@ def install(args, terminal=None):
         code = encode(dict(details, version=2, pairing=pairing.issue()))
     if terminal is not None:
         note("\n3/3  复制连接码")
+    note("在这台远程设备上卸载可运行 ~/.local/bin/termlo uninstall")
     note("安装完成。将下面一整行粘贴到 Mac 的「添加服务器」，点「连接」。")
     note("连接码在 10 分钟内有效，可绑定一台 Mac。以后在这台 Mac 上点服务器名称即可连接。")
     print(code)
@@ -308,6 +328,8 @@ def main():
                       help="安装全部基础工具，跳过 Claude Code")
     mode.add_argument("--with-claude", dest="claude", action="store_true", default=None,
                       help="安装全部基础工具和 Claude Code")
+    removal = commands.add_parser("uninstall", help="卸载当前账号的 Termlo，撤销配对并移除安装器新增的工具")
+    removal.add_argument("--keep-tools", action="store_true", help="保留开发工具、浏览器和同步代理")
     add_endpoint_options(commands.add_parser("connection-code", help="生成可绑定一台 Mac 的新连接码"))
     redeem = commands.add_parser("redeem", help=argparse.SUPPRESS)
     redeem.add_argument("ticket")
@@ -316,28 +338,39 @@ def main():
     login.add_argument("--session", type=browser.session_id, help="由 Mac 客户端分配的会话 UUID")
     args = parser.parse_args()
     try:
-        if args.command == "install" and len(sys.argv) == 2:
-            try:
-                terminal = open("/dev/tty", "r", encoding="utf-8")
-            except OSError:
-                raise ValueError("安装向导需要交互终端。请在设备控制台或交互式 SSH 会话中运行。") from None
-            with terminal:
-                install(args, terminal)
-        elif args.command == "install":
-            install(args)
-        elif args.command == "connection-code":
-            details = connection_details(**connection_settings(args), include_host_key=True)
-            print(encode(dict(details, version=2, pairing=pairing.issue())))
-        elif args.command == "redeem":
-            print(pairing.redeem(args.ticket, os.environ.get("SSH_ORIGINAL_COMMAND", "")))
-        elif args.action == "check":
-            print("原生浏览器可启动并渲染测试页：" + native_browser.check())
-        else:
-            browser.manage(args.action, args.session, config_dir())
+        with uninstall.account_lock(exclusive=args.command == "uninstall"):
+            # A command loaded from the zipapp may have waited for removal to finish.
+            if args.command != "uninstall" and not Path(sys.argv[0]).exists():
+                raise ValueError("此账号的 Termlo 已卸载。")
+            dispatch(args)
     except (EOFError, KeyboardInterrupt):
-        parser.exit(130, "\n安装已取消。\n")
+        parser.exit(130, "\n操作已取消。\n")
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         parser.exit(1, f"Termlo：{error}\n")
+
+
+def dispatch(args):
+    if args.command == "install" and len(sys.argv) == 2:
+        try:
+            terminal = open("/dev/tty", "r", encoding="utf-8")
+        except OSError:
+            raise ValueError("安装向导需要交互终端。请在设备控制台或交互式 SSH 会话中运行。") from None
+        with terminal:
+            install(args, terminal)
+    elif args.command == "install":
+        install(args)
+    elif args.command == "uninstall":
+        add_tool_paths()
+        uninstall.run(config_dir(), args.keep_tools)
+    elif args.command == "connection-code":
+        details = connection_details(**connection_settings(args), include_host_key=True)
+        print(encode(dict(details, version=2, pairing=pairing.issue())))
+    elif args.command == "redeem":
+        print(pairing.redeem(args.ticket, os.environ.get("SSH_ORIGINAL_COMMAND", "")))
+    elif args.action == "check":
+        print("原生浏览器可启动并渲染测试页：" + native_browser.check())
+    else:
+        browser.manage(args.action, args.session, config_dir())
 
 
 if __name__ == "__main__":

@@ -56,6 +56,40 @@ def invitation_entry(line):
     return None
 
 
+def binding_command(ticket):
+    command = shlex.quote(str(Path.home() / ".local/bin/termlo")) + " redeem " + ticket
+    return command.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def managed_key(line):
+    line = line.rstrip(b"\r\n")
+    entry = invitation_entry(line)
+    if entry:
+        command = binding_command(entry[2].decode()).encode()
+        match = re.fullmatch(rb'restrict,expiry-time="[0-9]{14}",command="' + re.escape(command)
+                             + rb'" ssh-ed25519 ([A-Za-z0-9+/]{68})', line[:entry.start()])
+    else:
+        match = re.fullmatch(rb"ssh-ed25519 ([A-Za-z0-9+/]{68}) termlo-mac", line)
+    return bool(match and base64.b64decode(match[1]).startswith(ED25519_PREFIX))
+
+
+def revoke_all():
+    directory = Path.home() / ".ssh"
+    keys = directory / "authorized_keys"
+    lock = directory / ".termlo-pair.lock"
+    count = 0
+    # An account with only ordinary keys can have a read-only .ssh directory.
+    if keys.is_file() and any(managed_key(line) for line in keys.read_bytes().splitlines()):
+        with locked_authorized_keys() as (path, lines):
+            remaining = [line for line in lines if not managed_key(line)]
+            count = len(lines) - len(remaining)
+            if count:
+                write_keys(path, remaining, None)
+    if lock.is_file() and not lock.is_symlink() and lock.stat().st_size == 0:
+        lock.unlink()
+    return count
+
+
 def issue():
     with tempfile.TemporaryDirectory() as temp:
         key = Path(temp) / "invite"
@@ -64,8 +98,7 @@ def issue():
         public = key.with_suffix(".pub").read_bytes().strip()
         private = key.read_text(encoding="ascii")
     ticket = secrets.token_hex(16)
-    command = shlex.quote(str(Path.home() / ".local/bin/termlo")) + " redeem " + ticket
-    command = command.replace("\\", "\\\\").replace('"', '\\"')
+    command = binding_command(ticket)
     with locked_authorized_keys() as (path, lines):
         now = int(time.time())
         expires = now + LIFETIME

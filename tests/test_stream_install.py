@@ -141,6 +141,40 @@ esac
         self.assertEqual((ROOT / "install.sh").read_bytes(), (ROOT / "dist/termlo-install.sh").read_bytes())
         self.assertEqual(self.bundle.read_bytes(), (ROOT / "install.sh").read_bytes())
 
+    def test_installed_uninstall_and_repeat_via_piped_bundle(self):
+        cli = self.home / ".local/bin/termlo"
+        folder = self.home / "config/termlo"
+        keys = self.home / ".ssh/authorized_keys"
+        keys.parent.mkdir()
+        original = (self.home / "host_key.pub").read_bytes()
+        keys.write_bytes(original)
+        subprocess.run(["bash", str(self.bundle), "--sync-only"], env=self.env, capture_output=True, check=True)
+        self.assertIn(b"termlo-pair:", keys.read_bytes())
+        self.assertTrue((folder / "installed-components.json").is_file())
+        result = subprocess.run([str(cli), "uninstall"], env=self.env, capture_output=True, text=True, check=True)
+        self.assertIn("卸载完成", result.stderr)
+        self.assertFalse(cli.exists())
+        self.assertEqual(keys.read_bytes(), original)
+        self.assertFalse(folder.exists())
+        self.assertTrue((self.home / ".mutagen/agents/0.18.1/mutagen-agent").exists())
+        geo = (self.home / "geo-log").read_bytes()
+        subprocess.run(["bash", "-s", "--", "uninstall"], input=self.bundle.read_bytes(),
+                       env=self.env, capture_output=True, check=True, start_new_session=True)
+        self.assertEqual((self.home / "geo-log").read_bytes(), geo)
+        self.assertFalse((self.home / "bad-url").exists())
+        self.assertFalse(folder.exists())
+
+    def test_standalone_uninstaller_cleans_legacy_install_without_bootstrapping(self):
+        cli = self.home / ".local/bin/termlo"
+        subprocess.run(["bash", str(self.bundle), "--sync-only"], env=self.env, capture_output=True, check=True)
+        (self.home / "config/termlo/installed-components.json").unlink()
+        result = subprocess.run(["bash", "-s", "--", "uninstall"], input=self.bundle.read_text(),
+                                env=self.env, capture_output=True, text=True, check=True, start_new_session=True)
+        self.assertIn("旧版本", result.stderr)
+        self.assertFalse(cli.exists())
+        self.assertFalse((self.home / "config/termlo/connection.json").exists())
+        self.assertTrue((self.home / ".mutagen/agents/0.18.1/mutagen-agent").exists())
+
     def test_missing_python_bootstraps_packages_and_reuses_one_region_lookup(self):
         tools = self.home / "bin"
         (tools / "python3").unlink()

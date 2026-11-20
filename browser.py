@@ -36,8 +36,8 @@ def session_id(value):
         raise argparse.ArgumentTypeError("会话 ID 应为 UUID") from None
 
 
-def available_engine(timeout=None):
-    for engine in ("podman", "docker"):
+def available_engine(timeout=None, engines=("podman", "docker")):
+    for engine in engines:
         if not shutil.which(engine):
             continue
         # A developer may have pointed the CLI at another machine. The SSH tunnel ends here.
@@ -55,6 +55,39 @@ def available_engine(timeout=None):
         if info.returncode == 0:
             return engine
     return None
+
+
+def stop_owned_sessions(folder):
+    # Legacy clients used a labeled, ephemeral container. Its name, label and
+    # account must agree before removing an immutable container ID.
+    prefix = f"termlo-login-{os.getuid()}-"
+    complete = True
+    with (folder / "browser.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        for engine in ("podman", "docker"):
+            if not shutil.which(engine):
+                continue
+            if not available_engine(timeout=8, engines=(engine,)):
+                print(f"无法访问本机 {engine}，其中的旧版浏览器会话未核对。", file=sys.stderr)
+                complete = False
+                continue
+            rows = subprocess.run([engine, "ps", "-a", "--filter", f"label={LABEL}", "--format",
+                                   "{{.Names}}"], capture_output=True,
+                                  text=True, timeout=15, check=True)
+            for name in rows.stdout.splitlines():
+                if not name.startswith(prefix):
+                    continue
+                session = name[len(prefix):]
+                if session != "default":
+                    try:
+                        if str(uuid.UUID(session)) != session:
+                            continue
+                    except ValueError:
+                        continue
+                container = inspect_container(engine, name, f"{os.getuid()}-{session}", skip_foreign=True)
+                if container:
+                    subprocess.run([engine, "rm", "-f", "-v", container["Id"]], stdout=sys.stderr, check=True)
+    return complete
 
 
 def require_engine():
@@ -82,7 +115,7 @@ def prepare_image(engine, region):
         subprocess.run([engine, "pull", fallback], stdout=sys.stderr, check=True)
 
 
-def inspect_container(engine, name, owner):
+def inspect_container(engine, name, owner, *, skip_foreign=False):
     result = subprocess.run([engine, "container", "inspect", name], capture_output=True, text=True)
     if result.returncode:
         # Check presence separately so a runtime or permission error cannot turn into a successful stop.
@@ -93,6 +126,8 @@ def inspect_container(engine, name, owner):
         raise ValueError(result.stderr.strip() or "无法读取登录容器。")
     container = json.loads(result.stdout)[0]
     if (container["Config"].get("Labels") or {}).get(LABEL) != owner:
+        if skip_foreign:
+            return None
         raise ValueError(f"已有其他容器使用名称 {name}，请先核对。")
     return container
 

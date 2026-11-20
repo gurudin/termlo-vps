@@ -18,6 +18,22 @@ curl -fsSL https://raw.githubusercontent.com/gurudin/termlo-vps/main/install.sh 
 
 重新生成连接码时，在远端运行 `~/.local/bin/termlo connection-code`。已有绑定可继续使用。[连接码说明](CONNECTION_CODE.md)
 
+## 一键卸载
+
+在远程设备上，用当初安装 Termlo 的 SSH 账号运行以下命令。新版和旧版都可以使用这个入口。
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/gurudin/termlo-vps/main/install.sh | bash -s -- uninstall
+```
+
+新版也可以直接在远端运行 `~/.local/bin/termlo uninstall`，无需下载安装脚本。
+
+卸载会撤销该账号的 Termlo 连接码和已配对 Mac 的 SSH 授权，清理 Termlo 命令与连接配置。新版安装器还会记录实际新增的 Git、tmux、ADB、浏览器、Mutagen 代理及选装的 Claude Code，卸载时按记录移除。若其他项目也在使用这些工具，可在命令末尾加 `--keep-tools`。移除系统软件包时可能需要 sudo。
+
+旧版没有组件来源记录，共用工具会保留。用户的工程文件、其他 SSH 公钥、Claude 账号数据和会话历史均保留。Python、Homebrew、系统 SSH 和包管理器的依赖按共用组件处理。撤销配对对后续 SSH 连接生效，已经打开的终端可以正常退出。
+
+Linux 的 root 安装若新增了专用浏览器账号，卸载会核对账号和主目录后清理。主目录已有额外内容时，保留该账号及其文件，并在终端说明。
+
 ## 各组件的安装方式
 
 | 组件 | 安装方式 |

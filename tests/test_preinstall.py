@@ -61,16 +61,17 @@ class BrowserInstallTests(unittest.TestCase):
         check.assert_called_once_with(prepare_root=True)
 
     def test_ubuntu_uses_installed_snap_service_for_a_missing_browser(self):
-        packages = Mock()
         with tempfile.TemporaryDirectory() as tmp:
             release = Path(tmp) / "os-release"
             release.write_text('ID="ubuntu"\n')
+            packages = termlo.SystemPackages("global", tmp, termlo.uninstall.Receipt(Path(tmp)))
             with patch.object(sys, "platform", "linux"), patch.object(termlo, "OS_RELEASE", release), \
                  patch.object(native_browser, "executable", return_value=None), patch.object(native_browser, "check"), \
+                 patch.object(packages, "install") as install_packages, \
                  patch("shutil.which", return_value="/usr/bin/snap"), patch.object(os, "getuid", return_value=501), \
                  patch("subprocess.run", return_value=subprocess.CompletedProcess([], 1)) as run:
                 termlo.ensure_browser(packages)
-        packages.install.assert_not_called()
+        install_packages.assert_not_called()
         self.assertIn(call(["sudo", "snap", "install", "chromium"], check=True), run.call_args_list)
 
     def test_root_browser_probe_uses_only_the_dedicated_unprivileged_account(self):
