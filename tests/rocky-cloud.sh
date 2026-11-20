@@ -17,6 +17,7 @@ qemu-img resize guest.qcow2 14G
 ssh-keygen -qt ed25519 -N '' -f guest-key
 cat > user-data <<EOF
 #cloud-config
+disable_root: false
 users:
   - name: termlotest
     sudo: "ALL=(ALL) NOPASSWD:ALL"
@@ -32,13 +33,15 @@ sudo qemu-system-x86_64 -accel kvm -cpu host -smp 2 -m 4096 -display none -monit
     -serial "file:$PWD/console.log" -daemonize -pidfile "$PWD/guest.pid" \
     -drive "file=$PWD/guest.qcow2,if=virtio,format=qcow2" -drive "file=$PWD/seed.img,if=virtio,format=raw" \
     -nic user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:22022-:22
-trap 'sudo kill "$(cat guest.pid)" || true' EXIT
-guest=(ssh -i "$PWD/guest-key" -p 22022 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$PWD/known" \
-       -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=3 termlotest@127.0.0.1)
+trap 'sudo kill "$(sudo cat guest.pid)" || true' EXIT
+transport=(ssh -i "$PWD/guest-key" -p 22022 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$PWD/known" \
+           -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=3)
+guest=("${transport[@]}" termlotest@127.0.0.1)
 for ((attempt=0; attempt<90; attempt++)); do
     if "${guest[@]}" 'test -f /etc/termlo-disposable-cloud-test' 2>/dev/null; then break; fi
     sleep 2
 done
 "${guest[@]}" 'test -f /etc/termlo-disposable-cloud-test' || { sudo tail -80 console.log; exit 1; }
 git -C "$repo" archive HEAD | "${guest[@]}" 'sudo mkdir -p /src && sudo tar -xf - -C /src'
-"${guest[@]}" 'sudo env TERMLO_DISPOSABLE_INSTALL_TEST=1 sh /src/tests/clean-install.sh'
+"${guest[@]}" 'sudo install -d -m 700 /root/.ssh && sudo tee -a /root/.ssh/authorized_keys >/dev/null' < guest-key.pub
+"${transport[@]}" root@127.0.0.1 'TERMLO_DISPOSABLE_INSTALL_TEST=1 sh /src/tests/clean-install.sh'
