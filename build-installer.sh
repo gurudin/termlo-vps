@@ -49,7 +49,8 @@ if ! command -v bash >/dev/null 2>&1; then
     install_bash() {
         if [ "$(id -u)" = 0 ]; then "$@"
         elif command -v sudo >/dev/null 2>&1; then sudo "$@"
-        else doas "$@"; fi
+        elif command -v doas >/dev/null 2>&1; then doas "$@"
+        else echo "准备 Bash 需要管理员权限，当前账号无法使用 sudo 或 doas。" >&2; return 1; fi
     }
     case $set_bash_pkg in
         apk) install_bash apk add --no-cache bash ;;

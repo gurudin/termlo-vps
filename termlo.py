@@ -182,8 +182,6 @@ def claude_available():
 
 def ensure_claude(packages):
     if not claude_available():
-        if not shutil.which("curl"):
-            packages.install(["curl"])
         note("正在为当前 SSH 用户安装 Claude Code 稳定版…")
         with tempfile.TemporaryDirectory() as folder:
             script = Path(folder) / "install-claude.sh"
@@ -323,8 +321,9 @@ def install(args, terminal=None):
         settings = connection_settings(args, terminal, region, egress)
         details = connection_details(**settings, include_host_key=True)
         note("\n2/3  准备远程开发环境")
-        if not shutil.which("curl"):
+        if not tool_works(["curl", "--version"]):
             packages.install(["curl"])
+            subprocess.run(["curl", "--version"], stdout=subprocess.DEVNULL, check=True)
         note(f"正在准备 Mutagen {sync_agent.VERSION} 远端同步代理…")
         agent = packages.with_https_repair(receipt.install_agent)
         note(f"双向同步的远端代理已就绪：{agent}")

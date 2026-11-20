@@ -51,7 +51,7 @@ class InstallerTests(unittest.TestCase):
         for name in ("env", "bash", "ssh", "ssh-keygen", "scp", "mkdir", "mktemp", "rm", "cp", "cat", "chmod", "touch", "sh"):
             (self.bin / name).symlink_to(shutil.which(name, path="/usr/bin:/bin"))
         (self.bin / "python3").symlink_to(sys.executable)
-        command(self.bin / "curl", 'exit 1')
+        command(self.bin / "curl", 'test "$1" = --version')
         agent = sync_agent.installed_path()
         agent.parent.mkdir(parents=True)
         command(agent, 'echo ' + sync_agent.VERSION)
@@ -141,6 +141,7 @@ if [ "$1" = install ]; then
     done
 fi''')
         command(self.bin / "curl", '''
+[ "$1" != --version ] || exit 0
 while [ "$1" != -o ]; do shift; done
 test "$3" = https://claude.ai/install.sh
 cat > "$2" <<'SH'
@@ -204,7 +205,7 @@ SH''')
 
     def test_china_claude_is_optional_and_uses_only_the_official_installer(self):
         self.prepare_fake_linux_tools()
-        command(self.bin / "curl", 'for url do :; done; echo "$url" >> "$EVENTS"; exit 7')
+        command(self.bin / "curl", '[ "$1" != --version ] || exit 0; for url do :; done; echo "$url" >> "$EVENTS"; exit 7')
         with patch.dict(os.environ, TERMLO_INSTALL_NETWORK="cn"), \
              patch.object(wizard, "suggest_host", return_value=("dev.example.org", "当前 SSH 会话")):
             defaults = self.wizard_install("\n\n\n")

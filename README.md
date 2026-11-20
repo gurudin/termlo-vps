@@ -59,7 +59,7 @@ git --version
 adb version
 ```
 
-浏览器检查使用独立的临时配置，不需要桌面或 Claude 账号。现有 Mac 客户端的「登录 Claude」仍按旧的容器浏览器协议连接，原生浏览器的远程画面需要客户端配合。旧版 `termlo browser start/stop` 保留给已配置容器浏览器的设备。
+浏览器检查会在独立的临时配置中渲染测试页。新版 Mac 客户端的「登录 Claude」会检查远端环境并使用远端的原生浏览器。旧版 `termlo browser start/stop` 保留给已配置容器浏览器的设备。
 
 双向同步由使用 Termlo 的 Mac 发起。在 Mac 上准备好 Mutagen 后，选择本机和远端的项目目录，开启工作区双向同步。Mac 端使用其他版本时，Mutagen 会通过 SSH 安装与客户端匹配的代理。[Mutagen SSH 文档](https://mutagen.io/documentation/transports/ssh/) · [Mac 端安装说明](https://mutagen.io/documentation/introduction/installation/)
 

@@ -1,8 +1,9 @@
 #!/bin/sh
 # Runs inside a fresh, disposable Linux image with the checkout mounted at /src.
 set -eu
-[ -f /.dockerenv ] && [ -f /src/install.sh ] && [ "${TERMLO_DISPOSABLE_INSTALL_TEST:-}" = 1 ] || {
-    echo "Run this check inside its disposable CI container." >&2
+{ [ -f /.dockerenv ] || [ -f /etc/termlo-disposable-cloud-test ]; } &&
+    [ -f /src/install.sh ] && [ "${TERMLO_DISPOSABLE_INSTALL_TEST:-}" = 1 ] || {
+    echo "Run this check inside its disposable CI guest." >&2
     exit 1
 }
 umask 077
@@ -86,3 +87,15 @@ ssh termlo-test "printf returned > '$work/vps-project/file'"
 ./mutagen sync flush termlo-test
 test "$(cat mac-project/file)" = returned
 ./mutagen sync terminate termlo-test
+
+if [ "$ID" = debian ]; then
+    # Exercise the library fallback when both APT frontends are missing.
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-apt
+    mv /usr/bin/apt "$work/original-apt"
+    mv /usr/bin/apt-get "$work/recovered-apt-get"
+    mv /usr/bin/tmux "$work/original-tmux"
+    install_termlo
+    apt-get --version >/dev/null
+    tmux -V
+    test "$(ssh termlo-test 'printf paired')" = paired
+fi

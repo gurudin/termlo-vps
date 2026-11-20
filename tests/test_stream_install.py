@@ -48,6 +48,7 @@ class StreamInstallTests(unittest.TestCase):
         (tools / "curl").write_text("""#!/bin/bash
 url=${!#}
 case $url in
+    --version) exec "$REAL_CURL" --version ;;
     file://*) exec "$REAL_CURL" "$@" ;;
     https://www.cloudflare.com/cdn-cgi/trace)
         echo probe >> "$HOME/geo-log"

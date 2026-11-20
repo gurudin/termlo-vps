@@ -140,31 +140,37 @@ as_root() {
     fi
 }
 
+apt_ready() {
+    command -v apt-get >/dev/null && apt-get --version >/dev/null 2>&1
+}
+
 restore_apt() {
-    command -v apt-get >/dev/null && return 0
+    apt_ready && return 0
+    if [[ -x /usr/bin/apt-get ]] && /usr/bin/apt-get --version >/dev/null 2>&1; then export PATH="/usr/bin:$PATH"; return 0; fi
     echo "正在恢复系统的 APT 工具。" >&2
     if command -v apt >/dev/null; then
-        as_root apt update && as_root apt install -y --reinstall apt || return 1
-    elif command -v aptitude >/dev/null; then
-        as_root aptitude update && as_root aptitude reinstall -y apt || return 1
-    elif command -v python3 >/dev/null && python3 -c 'import apt' 2>/dev/null; then
-        as_root python3 -c 'import apt
+        if as_root apt update && as_root apt install -y --reinstall apt && apt_ready; then return 0; fi
+    fi
+    if command -v aptitude >/dev/null; then
+        if as_root aptitude update && as_root aptitude reinstall -y apt && apt_ready; then return 0; fi
+    fi
+    if command -v python3 >/dev/null && python3 -c 'import apt' 2>/dev/null; then
+        if as_root python3 -c 'import apt
 cache = apt.Cache()
 cache.update()
 cache.open(None)
 package = cache["apt"]
 if package.is_installed:
-    package.mark_reinstall()
+    cache._depcache.set_reinstall(package._pkg, True)
 else:
     package.mark_install()
-cache.commit()' || return 1
-    elif command -v pkcon >/dev/null; then
-        as_root pkcon --noninteractive install apt || return 1
-    else
-        echo "系统缺少 apt-get 和可用于恢复它的 APT 工具。请从此发行版的签名软件源恢复 apt 软件包，再运行同一条安装命令。" >&2
-        return 1
+cache.commit()' && apt_ready; then return 0; fi
     fi
-    command -v apt-get >/dev/null || { echo "恢复 apt 后仍找不到 apt-get。" >&2; return 1; }
+    if command -v pkcon >/dev/null; then
+        if as_root pkcon --noninteractive install apt && apt_ready; then return 0; fi
+    fi
+    echo "未能通过当前系统的软件工具恢复 apt-get。请从此发行版的签名软件源恢复 apt 软件包，再运行同一条安装命令。" >&2
+    return 1
 }
 
 install_rpm() {
@@ -182,7 +188,7 @@ install_rpm() {
         if ! as_root env LC_ALL=C "$manager" -y --setopt=install_weak_deps=False install "${missing[@]}" 2>&1 | tee "$state/rpm-install.log"; then
             # EL keeps Chromium and Android tools in EPEL. Use distribution-provided,
             # signed repository packages and leave other package failures visible.
-            grep -Eqi 'no match for argument|unable to find a match|no package .+ available|no package matches' "$state/rpm-install.log" || return 1
+            grep -Eqi 'no match for argument|unable to find a match|no package .+ available|no package matches|nothing provides' "$state/rpm-install.log" || return 1
             case " ${missing[*]} " in *" chromium "*|*" android-tools "*|*" tmux "*) ;; *) return 1 ;; esac
             [[ -r /etc/redhat-release || -r /etc/alinux-release || -r /etc/anolis-release ]] || return 1
             as_root "$manager" -y install epel-release || {
