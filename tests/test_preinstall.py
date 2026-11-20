@@ -49,6 +49,38 @@ class RemoteAgentTests(unittest.TestCase):
                 self.assertEqual(list(target.parent.iterdir()), [target])
 
 
+class DownloadTrustTests(unittest.TestCase):
+    def setUp(self):
+        self.packages = termlo.SystemPackages("global", "", None)
+
+    def test_success_does_not_require_a_specific_ca_file(self):
+        with patch.dict(os.environ, {"CURL_CA_BUNDLE": "/a/platform/specific/bundle"}), \
+             patch.object(self.packages, "install") as install:
+            self.assertEqual(self.packages.with_https_repair(lambda: "downloaded"), "downloaded")
+            install.assert_not_called()
+
+    def test_unreadable_system_store_is_repaired_once_then_retried(self):
+        download = Mock(side_effect=[subprocess.CalledProcessError(77, ["curl"]), "ok"])
+        with patch.dict(os.environ, {}, clear=True), patch.object(sys, "platform", "linux"), \
+             patch.object(self.packages, "install") as install:
+            self.assertEqual(self.packages.with_https_repair(download), "ok")
+            install.assert_called_once_with(["ca-certificates"])
+            self.assertEqual(download.call_count, 2)
+            with self.assertRaises(subprocess.CalledProcessError):
+                self.packages.with_https_repair(Mock(side_effect=subprocess.CalledProcessError(77, ["curl"])))
+            install.assert_called_once()
+
+    def test_reset_custom_ca_and_untrusted_peer_do_not_change_system_trust(self):
+        with patch.object(sys, "platform", "linux"), patch.object(self.packages, "install") as install, \
+             patch("ssl.create_default_context") as trust:
+            trust.return_value.get_ca_certs.return_value = [{}]
+            for status, env, error in [(35, {}, subprocess.CalledProcessError), (60, {}, ValueError),
+                                       (77, {"CURL_CA_BUNDLE": "/custom"}, ValueError)]:
+                with self.subTest(status=status), patch.dict(os.environ, env, clear=True), self.assertRaises(error):
+                    self.packages.with_https_repair(Mock(side_effect=subprocess.CalledProcessError(status, ["curl"])))
+            install.assert_not_called()
+
+
 class BrowserInstallTests(unittest.TestCase):
     def test_remote_mac_installs_native_browser_and_platform_tools_with_homebrew(self):
         packages = Mock()

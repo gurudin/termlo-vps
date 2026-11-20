@@ -1,6 +1,6 @@
 # Termlo 远端安装器
 
-在远程 Mac、Linux 电脑或 VPS 上，用平时连接这台设备的 SSH 账号运行安装器。默认准备 Git、tmux、ADB、Mutagen 远端同步代理和原生浏览器，只有 Claude Code 需要选择。Linux 软件包安装适用于 Debian 12+ 和 Ubuntu 22.04+，同步代理支持 Intel/AMD 64 位和 ARM64。远程 Mac 使用 Homebrew 支持的 macOS 版本。
+在远程 Mac、Linux 电脑或 VPS 上，用平时连接这台设备的 SSH 账号运行安装器。默认准备 Git、tmux、ADB、Mutagen 远端同步代理和原生浏览器，只有 Claude Code 需要选择。安装器自动选择远端系统的软件源。同步代理支持 Intel/AMD 64 位和 ARM64。远程 Mac 使用 Homebrew 支持的 macOS 版本。
 
 ## 安装和连接
 
@@ -11,6 +11,8 @@ curl -fsSL https://raw.githubusercontent.com/gurudin/termlo-vps/main/install.sh 
 ```
 
 也可以将仓库根目录的 `install.sh` 复制到远端，运行 `bash install.sh`。这两种方式使用同一份完整安装器。
+
+只有 BusyBox 和 wget 的 Alpine 可使用同一地址执行 `wget -qO- https://raw.githubusercontent.com/gurudin/termlo-vps/main/install.sh | sh`。安装器会通过 APK 准备 Bash。
 
 1. **确认 SSH 地址和端口。** 检查向导给出的建议值。使用 NAT 或端口映射时，填写你的 Mac 实际能访问的地址和对外端口。安装器自动读取当前账号和主机公钥。
 2. **准备开发环境。** 向导复用已有软件，安装缺项并检查各项工具。它会运行同步代理确认版本，启动原生浏览器、渲染一张本地测试页，然后关闭测试实例。只有 Claude Code 可以选装或跳过。必需项出错时会停止，处理后可以用同一条命令重试。
@@ -38,8 +40,8 @@ Linux 的 root 安装若新增了专用浏览器账号，卸载会核对账号�
 
 | 组件 | 安装方式 |
 |---|---|
-| Git、tmux、ADB | Linux 使用 APT。macOS 使用 Homebrew，ADB 来自 Android Platform Tools。ADB 命令行供远端开发工具调用，连接本机手机还需要建立对应工作区的设备通道。 |
-| 原生浏览器 | 优先使用已有的 Chromium 或 Chrome。Debian 安装 Chromium 及其沙盒，Ubuntu 安装 Chromium Snap，macOS 缺少浏览器时安装 Google Chrome（Chromium 内核）。默认安装无需 Docker 或 Podman。 |
+| Git、tmux、ADB | Debian、Ubuntu 使用 APT，RPM 系统使用 DNF 或 YUM，Alpine 使用 APK，远程 Mac 使用 Homebrew。ADB 命令行供远端开发工具调用，连接本机手机还需要建立对应工作区的设备通道。 |
+| 原生浏览器 | 优先复用能渲染测试页的 Chromium 或 Chrome。Debian、RPM 系统和 Alpine 通过软件源安装 Chromium，Ubuntu 使用 Chromium Snap，macOS 缺少浏览器时安装 Google Chrome（Chromium 内核）。 |
 | Mutagen 同步代理 | 从官方 v0.18.1 发布包提取当前系统和处理器对应的代理，校验 SHA-256 后安装到 SSH 用户的 Mutagen 版本目录。其他版本的代理可以共存。 |
 | Claude Code | 选装时使用当前 SSH 用户运行 Anthropic 官方稳定版安装程序。中国大陆出口默认跳过。 |
 

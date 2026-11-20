@@ -16,9 +16,30 @@ jobs:
       matrix:
         image: ['debian:12-slim', 'quay.io/rockylinux/rockylinux:9', 'alpine:3.22']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install, bind over SSH and sync a file in both directions
         run: |
           docker run --rm --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
             -e TERMLO_DISPOSABLE_INSTALL_TEST=1 --mount type=bind,src="$PWD",dst=/src,readonly \
             '${{ matrix.image }}' sh /src/tests/clean-install.sh
+
+  existing-host:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - name: Reuse working tools and render a page with the native browser
+        env:
+          TERMLO_INSTALL_NETWORK: global
+        run: |
+          umask 077
+          ssh-keygen -q -t ed25519 -N '' -f "$RUNNER_TEMP/host-key"
+          for attempt in 1 2; do
+            bash install.sh --without-claude --host 127.0.0.1 --host-key "$RUNNER_TEMP/host-key.pub" > "$RUNNER_TEMP/code"
+            grep -q '^termlo://connect/' "$RUNNER_TEMP/code"
+          done
+          "$HOME/.local/bin/termlo" browser check

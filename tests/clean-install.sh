@@ -11,7 +11,10 @@ work=$PWD
 export TERMLO_INSTALL_NETWORK=global
 . /etc/os-release
 case "$ID" in
-    debian) apt-get update; DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssh-server ;;
+    debian)
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssh-server
+        mv /usr/bin/apt-get "$work/original-apt-get" ;;
     rocky) dnf -y install openssh-server ;;
     alpine) apk add --no-cache openssh-server openssh-keygen ;;
     *) exit 1 ;;
@@ -20,7 +23,7 @@ mkdir -p /run/sshd
 ssh-keygen -A
 # The test SSH service accepts keys on container loopback only.
 sed -i 's|^root:[^:]*:|root:*:|' /etc/shadow
-/usr/sbin/sshd -o ListenAddress=127.0.0.1 -p 2222 -o PasswordAuthentication=no -o PermitRootLogin=prohibit-password
+/usr/sbin/sshd -e -o ListenAddress=127.0.0.1 -p 2222 -o PasswordAuthentication=no -o PermitRootLogin=prohibit-password
 
 install_termlo() {
     cat /src/install.sh | sh -s -- --without-claude --host 127.0.0.1 --port 2222 > "$work/code"

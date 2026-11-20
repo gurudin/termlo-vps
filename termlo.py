@@ -177,13 +177,7 @@ class SystemPackages:
 
 
 def claude_available():
-    path = shutil.which("claude")
-    if not path:
-        return False
-    try:
-        return subprocess.run([path, "--version"], capture_output=True, timeout=10).returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        return False
+    return tool_works(["claude", "--version"])
 
 
 def ensure_claude(packages):
@@ -193,9 +187,10 @@ def ensure_claude(packages):
         note("正在为当前 SSH 用户安装 Claude Code 稳定版…")
         with tempfile.TemporaryDirectory() as folder:
             script = Path(folder) / "install-claude.sh"
-            packages.with_https_repair(lambda: subprocess.run(["curl", "-q", "--proto", "=https", "--proto-redir", "=https", "-fsSL",
-                            "--connect-timeout", "5", "--max-time", "45", "--retry", "2",
-                            "-o", str(script), "https://claude.ai/install.sh"], check=True))
+            download = ["curl", "-q", "--proto", "=https", "--proto-redir", "=https", "-fsSL",
+                        "--connect-timeout", "5", "--max-time", "45", "--retry", "2",
+                        "-o", str(script), "https://claude.ai/install.sh"]
+            packages.with_https_repair(lambda: subprocess.run(download, check=True))
             with packages.receipt.observe_claude():
                 subprocess.run(["bash", str(script), "stable"], stdout=sys.stderr, check=True)
     subprocess.run(["claude", "--version"], stdout=sys.stderr, check=True)

@@ -52,9 +52,11 @@ set -eu
 umask 077
 cd "$HOME"
 base=$HOME
-case "$1" in
-    /snap/bin/chromium|*/chromium-browser) base="$HOME/snap/chromium/common"; mkdir -p "$base" ;;
-esac
+if [ -x /snap/bin/chromium ]; then
+    case "$1" in
+        /snap/bin/chromium|*/chromium-browser) base="$HOME/snap/chromium/common"; mkdir -p "$base" ;;
+    esac
+fi
 profile=$(mktemp -d "$base/termlo-browser-check.XXXXXXXX")
 trap 'rm -rf -- "$profile"' EXIT
 trap 'exit 1' HUP INT TERM
@@ -95,6 +97,7 @@ def check(path=None, *, prepare_root=False):
             raise
         raise ValueError("Chromium 启动超时，请检查可用内存及系统浏览器的启动日志。") from None
     if process.returncode or "<title>termlo-browser-ready</title>" not in output:
-        detail = errors.strip()[-500:] or "未收到测试页内容"
+        fatal = [line for line in errors.splitlines() if "FATAL" in line or "error while loading" in line]
+        detail = "\n".join(fatal)[:1200] or errors.strip()[:1200] or "未收到测试页内容"
         raise ValueError(f"Chromium 未能正常渲染测试页（{path}）。{detail}")
     return path

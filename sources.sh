@@ -168,7 +168,8 @@ cache.commit()' || return 1
 }
 
 install_rpm() {
-    local manager name group
+    local state=$1 manager name group
+    shift
     local missing=() repair=()
     for manager in dnf yum microdnf; do
         command -v "$manager" >/dev/null && break
@@ -178,9 +179,10 @@ install_rpm() {
         if rpm -q "$name" >/dev/null 2>&1; then repair+=("$name"); else missing+=("$name"); fi
     done
     if (( ${#missing[@]} )); then
-        if ! as_root "$manager" -y install "${missing[@]}"; then
+        if ! as_root env LC_ALL=C "$manager" -y --setopt=install_weak_deps=False install "${missing[@]}" 2>&1 | tee "$state/rpm-install.log"; then
             # EL keeps Chromium and Android tools in EPEL. Use distribution-provided,
             # signed repository packages and leave other package failures visible.
+            grep -Eqi 'no match for argument|unable to find a match|no package .+ available|no package matches' "$state/rpm-install.log" || return 1
             case " ${missing[*]} " in *" chromium "*|*" android-tools "*|*" tmux "*) ;; *) return 1 ;; esac
             [[ -r /etc/redhat-release || -r /etc/alinux-release || -r /etc/anolis-release ]] || return 1
             as_root "$manager" -y install epel-release || {
@@ -193,7 +195,7 @@ install_rpm() {
                     break
                 fi
             done
-            as_root "$manager" -y "${extra[@]}" install "${missing[@]}" || return 1
+            as_root "$manager" -y --setopt=install_weak_deps=False "${extra[@]}" install "${missing[@]}" || return 1
         fi
     fi
     if (( ${#repair[@]} )); then as_root "$manager" -y reinstall "${repair[@]}"; fi
@@ -211,7 +213,7 @@ linux_packages() {
                 break
             done
             restore_apt && install_packages /etc/os-release "$region" "$state" "$@" ;;
-        rpm) install_rpm "$@" ;;
+        rpm) install_rpm "$state" "$@" ;;
         apk)
             local missing=() repair=()
             for name in "$@"; do

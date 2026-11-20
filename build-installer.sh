@@ -55,7 +55,7 @@ if ! command -v bash >/dev/null 2>&1; then
         apk) install_bash apk add --no-cache bash ;;
         apt-get) install_bash apt-get update && install_bash apt-get install -y bash ;;
         *) install_bash "$set_bash_pkg" -y install bash ;;
-    esac
+    esac >&2
 fi
 bash "$bundle/bootstrap.sh" "$@"
 )

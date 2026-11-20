@@ -39,7 +39,7 @@ usable_python() {
     local name
     for name in python3 python3.11 python3.9; do
         command -v "$name" >/dev/null || continue
-    # The system python3 on a fresh Mac is a developer-tools launcher.
+        # The system python3 on a fresh Mac is a developer-tools launcher.
         if [[ $system == Darwin && $(command -v "$name") == /usr/bin/python3 ]]; then
             /usr/bin/xcode-select -p >/dev/null 2>&1 || continue
         fi
