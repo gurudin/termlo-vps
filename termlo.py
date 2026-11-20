@@ -1,6 +1,7 @@
 """Termlo 远程开发环境安装器和用户命令。"""
 
 import argparse
+from contextlib import nullcontext
 import fcntl
 import ipaddress
 import json
@@ -9,6 +10,7 @@ from pathlib import Path
 import pkgutil
 import pwd
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -23,7 +25,6 @@ import wizard
 from connection_code import connection_details, encode
 
 
-SYSTEM_CA_BUNDLE = Path(os.environ.get("CURL_CA_BUNDLE") or "/etc/ssl/certs/ca-certificates.crt")
 SSH_KEY_DIRECTORY = Path("/etc/ssh")
 OS_RELEASE = Path("/etc/os-release")
 
@@ -117,26 +118,59 @@ class SystemPackages:
         self.region = region
         self.state = state
         self.receipt = receipt
+        self._family = None
+        self.trust_repaired = False
+
+    @property
+    def family(self):
+        if self._family is None:
+            self._family = ("formula" if sys.platform == "darwin" else
+                            run_sources("manager", str(OS_RELEASE), stdout=subprocess.PIPE).stdout.decode().strip())
+        return self._family
 
     def install(self, packages):
         if not packages:
             return
-        note("正在安装系统包 " + "、".join(packages))
-        if sys.platform == "darwin":
-            with self.receipt.observe_packages("formula", packages):
+        family = self.family
+        aliases = {
+            "rpm": {"openssh-client": ["openssh-clients"], "adb": ["android-tools"],
+                    "passwd": ["shadow-utils"]},
+            "apk": {"openssh-client": ["openssh-client-default", "openssh-keygen"], "adb": ["android-tools"],
+                    "passwd": ["shadow"], "util-linux": ["cmd:runuser"]},
+        }
+        names = [name for package in packages for name in aliases.get(family, {}).get(package, [package])]
+        note("正在安装或修复系统包 " + "、".join(names))
+        with self.receipt.observe_packages(family, names):
+            if family == "formula":
                 run_sources("brew", "formula", *packages, stdout=sys.stderr)
-            return
-        if not shutil.which("apt-get") or (os.getuid() != 0 and not shutil.which("sudo")):
-            raise ValueError("请先用系统包管理器安装 " + "、".join(packages) + "，再重试。")
-        with self.receipt.observe_packages("apt", packages):
-            run_sources("apt", self.region, self.state, *packages, stdout=sys.stderr)
+            else:
+                run_sources("linux", family, self.region, self.state, *names, stdout=sys.stderr)
+
+    def with_https_repair(self, action):
+        try:
+            return action()
+        except subprocess.CalledProcessError as error:
+            if (sys.platform != "linux" or self.trust_repaired or error.cmd[0] != "curl"
+                    or error.returncode not in (60, 77)):
+                raise
+            for variable in ("CURL_CA_BUNDLE", "SSL_CERT_FILE", "SSL_CERT_DIR"):
+                if os.environ.get(variable):
+                    raise ValueError(f"HTTPS 证书校验失败。请检查当前账号设置的 {variable}。") from error
+            if error.returncode == 60 and ssl.create_default_context().get_ca_certs():
+                raise ValueError("HTTPS 无法验证下载站点的证书，请检查系统时间、网络代理和上方的 curl 错误。") from error
+        self.trust_repaired = True
+        note("HTTPS 下载缺少可用的系统信任证书，正在修复后重试。")
+        self.install(["ca-certificates"])
+        return action()
 
     def cask(self, name):
         with self.receipt.observe_packages("cask", [name]):
             run_sources("brew", "cask", name, stdout=sys.stderr)
 
     def install_chromium_snap(self):
-        privilege = [] if os.getuid() == 0 else ["sudo"]
+        privilege = [] if os.getuid() == 0 else ["sudo" if shutil.which("sudo") else "doas"]
+        if Path("/run/systemd/system").is_dir():
+            subprocess.run([*privilege, "systemctl", "start", "snapd.socket"], check=True, timeout=60)
         subprocess.run([*privilege, "snap", "wait", "system", "seed.loaded"], timeout=240, check=True)
         with self.receipt.observe_packages("snap", ["chromium"]):
             subprocess.run([*privilege, "snap", "install", "chromium"], check=True)
@@ -154,53 +188,61 @@ def claude_available():
 
 def ensure_claude(packages):
     if not claude_available():
-        needed = [] if shutil.which("curl") else ["curl"]
-        if sys.platform == "linux" and not SYSTEM_CA_BUNDLE.is_file():
-            needed.append("ca-certificates")
-        packages.install(needed)
+        if not shutil.which("curl"):
+            packages.install(["curl"])
         note("正在为当前 SSH 用户安装 Claude Code 稳定版…")
         with tempfile.TemporaryDirectory() as folder:
             script = Path(folder) / "install-claude.sh"
-            subprocess.run(["curl", "--proto", "=https", "--proto-redir", "=https", "-fsSL",
+            packages.with_https_repair(lambda: subprocess.run(["curl", "-q", "--proto", "=https", "--proto-redir", "=https", "-fsSL",
                             "--connect-timeout", "5", "--max-time", "45", "--retry", "2",
-                            "-o", str(script), "https://claude.ai/install.sh"], check=True)
+                            "-o", str(script), "https://claude.ai/install.sh"], check=True))
             with packages.receipt.observe_claude():
                 subprocess.run(["bash", str(script), "stable"], stdout=sys.stderr, check=True)
     subprocess.run(["claude", "--version"], stdout=sys.stderr, check=True)
 
 
 def ensure_browser(packages):
-    path = native_browser.executable()
-    if sys.platform == "darwin":
-        if not path:
+    root_browser = sys.platform == "linux" and os.geteuid() == 0
+    if root_browser:
+        for command, package in (("useradd", "passwd"), ("runuser", "util-linux")):
+            if not shutil.which(command):
+                packages.install([package])
+    with packages.receipt.observe_browser_user() if root_browser else nullcontext():
+        if native_browser.executable():
+            try:
+                path = native_browser.check(prepare_root=True)
+                note(f"已复用能渲染测试页的远程浏览器：{path}")
+                return
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                note(f"现有浏览器检查未通过，正在修复。{error}")
+        if sys.platform == "darwin":
             packages.cask("google-chrome")
-    elif not path or Path(path).name == "chromium-browser":
-        ubuntu = OS_RELEASE.is_file() and any(line.strip() in ("ID=ubuntu", 'ID="ubuntu"', "ID='ubuntu'")
-                                             for line in OS_RELEASE.read_text().splitlines())
-        if ubuntu:
+        elif OS_RELEASE.is_file() and any(line.strip() in ("ID=ubuntu", 'ID="ubuntu"', "ID='ubuntu'")
+                                          for line in OS_RELEASE.read_text().splitlines()):
             if not shutil.which("snap"):
                 packages.install(["snapd"])
-            if subprocess.run(["snap", "list", "chromium"], capture_output=True).returncode:
-                packages.install_chromium_snap()
-        elif not path:
-            packages.install(["chromium", "chromium-sandbox"])
-    if sys.platform == "linux" and os.geteuid() == 0:
-        note("Chromium 将使用独立的非登录账号 termlo-browser 运行。SSH 仍绑定当前账号。")
-        with packages.receipt.observe_browser_user():
-            path = native_browser.check(prepare_root=True)
-    else:
+            packages.install_chromium_snap()
+        else:
+            packages.install(["chromium", "chromium-sandbox"] if packages.family == "apt" else ["chromium"])
         path = native_browser.check(prepare_root=True)
-    note(f"远程浏览器就绪，已在临时配置中启动并渲染测试页：{path}")
+    note(f"远程浏览器已启动并渲染测试页：{path}")
+
+
+def tool_works(command):
+    try:
+        return subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, timeout=10).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
 
 def ensure_base_tools(packages):
-    required = ["git", "tmux"]
-    if sys.platform == "linux":
-        required.append("adb")
-    packages.install([name for name in required if not shutil.which(name)])
-    if sys.platform == "darwin" and not shutil.which("adb"):
+    checks = [["git", "--version"], ["tmux", "-V"], ["adb", "version"]]
+    missing = [command[0] for command in checks if not tool_works(command)]
+    if sys.platform == "darwin" and "adb" in missing:
+        missing.remove("adb")
         packages.cask("android-platform-tools")
-    for command in (["git", "--version"], ["tmux", "-V"], ["adb", "version"]):
+    packages.install(missing)
+    for command in checks:
         subprocess.run(command, stdout=sys.stderr, check=True)
     note("正在准备并验证远程登录浏览器…")
     ensure_browser(packages)
@@ -241,7 +283,7 @@ def install_cli():
             shutil.copyfile(sys.argv[0], stage)
         else:
             with stage.open("wb") as output:
-                output.write(b"#!/usr/bin/env python3\n")
+                output.write(("#!" + sys.executable + "\n").encode())
                 with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED, strict_timestamps=False) as bundle:
                     for name in ("termlo.py", "connection_code.py", "pairing.py", "browser.py", "native_browser.py",
                                  "sync_agent.py", "uninstall.py", "wizard.py", "sources.sh"):
@@ -258,6 +300,8 @@ def add_tool_paths():
     os.environ["PATH"] = f"{Path.home()}/.local/bin:{Path.home()}/.npm-global/bin:" + os.environ["PATH"]
     if sys.platform == "darwin":
         os.environ["PATH"] += ":/opt/homebrew/bin:/usr/local/bin"
+    else:
+        os.environ["PATH"] += ":/usr/sbin:/sbin"
 
 
 def install(args, terminal=None):
@@ -270,10 +314,10 @@ def install(args, terminal=None):
     add_tool_paths()
     folder = config_dir()
     folder.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with (folder / "install.lock").open("a") as lock, tempfile.TemporaryDirectory(prefix="termlo-apt-") as state:
+    with (folder / "install.lock").open("a") as lock, tempfile.TemporaryDirectory(prefix="termlo-install-") as state:
         fcntl.flock(lock, fcntl.LOCK_EX)
         region, egress = install_network()
-        channels = {"cn": "中国大陆，APT 优先使用国内镜像", "global": "海外，优先使用系统源和官方源",
+        channels = {"cn": "中国大陆，按系统选择可用软件源", "global": "海外，优先使用系统源和官方源",
                     "auto": "未识别到出口地区，优先使用系统源"}
         note("下载线路：" + channels[region])
         receipt = uninstall.Receipt(folder)
@@ -286,10 +330,8 @@ def install(args, terminal=None):
         note("\n2/3  准备远程开发环境")
         if not shutil.which("curl"):
             packages.install(["curl"])
-        if sys.platform == "linux" and not SYSTEM_CA_BUNDLE.is_file():
-            packages.install(["ca-certificates"])
         note(f"正在准备 Mutagen {sync_agent.VERSION} 远端同步代理…")
-        agent = receipt.install_agent()
+        agent = packages.with_https_repair(receipt.install_agent)
         note(f"双向同步的远端代理已就绪：{agent}")
         if not args.sync_only:
             ensure_base_tools(packages)

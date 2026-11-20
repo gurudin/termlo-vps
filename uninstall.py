@@ -24,6 +24,8 @@ import sync_agent
 
 PACKAGES = {
     "apt": {"git", "tmux", "adb", "chromium", "chromium-sandbox"},
+    "rpm": {"git", "tmux", "android-tools", "chromium"},
+    "apk": {"git", "tmux", "android-tools", "chromium"},
     "formula": {"git", "tmux"},
     "cask": {"android-platform-tools", "google-chrome"},
     "snap": {"chromium"},
@@ -69,6 +71,10 @@ def package_present(kind, name, *, before_install=False):
     """True/False for a known result; never infer ownership from a broken package database."""
     if kind == "apt":
         command = ["dpkg-query", "-W", "-f=${db:Status-Status}", name]
+    elif kind == "rpm":
+        command = ["rpm", "-q", "--quiet", name]
+    elif kind == "apk":
+        command = ["apk", "info", "--exists", name]
     elif kind == "snap":
         command = ["snap", "list"]
     else:
@@ -77,6 +83,10 @@ def package_present(kind, name, *, before_install=False):
         # Homebrew can itself be bootstrapped by the cask/formula installer.
         return False if before_install and command[0] == "brew" else None
     result = subprocess.run(command, capture_output=True, text=True, env=dict(os.environ, LC_ALL="C"))
+    if kind in ("rpm", "apk"):
+        if result.returncode == 0:
+            return True
+        return False if result.returncode == 1 and not result.stderr.strip() else None
     if kind in ("snap", "formula", "cask"):
         if result.returncode == 0:
             return any(row.split()[0].split("/")[-1] == name for row in result.stdout.splitlines() if row.split())
@@ -226,7 +236,7 @@ class Receipt:
 
 def remove_packages(receipt):
     groups = receipt.data["packages"]
-    privilege = [] if os.geteuid() == 0 else ["sudo"]
+    privilege = [] if os.geteuid() == 0 else ["doas" if not shutil.which("sudo") and shutil.which("doas") else "sudo"]
     for kind, recorded in list(groups.items()):
         if kind not in PACKAGES or not isinstance(recorded, list) or any(name not in PACKAGES[kind] for name in recorded):
             raise ValueError("安装记录中有无法识别的软件包。")
@@ -243,6 +253,10 @@ def remove_packages(receipt):
                 # dpkg refuses removal when an unlisted package depends on one of these names.
                 # It cannot expand the removal to additional packages as APT's resolver can.
                 command = [*privilege, "dpkg", "--remove", *present]
+            elif kind == "rpm":
+                command = [*privilege, "rpm", "-e", *present]
+            elif kind == "apk":
+                command = [*privilege, "apk", "del", *present]
             elif kind == "snap":
                 command = [*privilege, "snap", "remove", *present]
             else:

@@ -59,12 +59,16 @@ def install():
         if local:
             archive = Path(local)
         else:
-            download = ["curl", "--proto", "=https", "--proto-redir", "=https", "-fL", "--retry", "2",
+            download = ["curl", "-q", "--proto", "=https", "--proto-redir", "=https", "-fL", "--retry", "2",
                         "--connect-timeout", "8", "--max-time", "600", "-o", str(archive)]
-            if subprocess.run([*download, url], stdout=sys.stderr).returncode:
+            first = subprocess.run([*download, url], stdout=sys.stderr)
+            if first.returncode:
                 print("正在通过 GitHub Releases API 重试同一个官方同步包…", file=sys.stderr, flush=True)
                 api = f"https://api.github.com/repos/mutagen-io/mutagen/releases/assets/{asset}"
-                subprocess.run([*download, "-H", "Accept: application/octet-stream", api], stdout=sys.stderr, check=True)
+                fallback = subprocess.run([*download, "-H", "Accept: application/octet-stream", api], stdout=sys.stderr)
+                if fallback.returncode and first.returncode in (60, 77):
+                    first.check_returncode()
+                fallback.check_returncode()
         digest = hashlib.sha256()
         with archive.open("rb") as stream:
             for block in iter(lambda: stream.read(1024 * 1024), b""):

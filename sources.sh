@@ -77,14 +77,13 @@ china_sources() (
 install_packages() {
     local release=$1 region=$2 state=$3 route preferred=system arch
     shift 3
-    local privilege=() options=() routes=(system cn)
-    if (( EUID != 0 )); then privilege=(sudo); fi
+    local options=() routes=(system cn)
     [[ $region != cn ]] || preferred=cn
     if [[ -s $state/preferred ]]; then read -r preferred < "$state/preferred"; fi
     if [[ $preferred == cn ]]; then routes=(cn system); fi
 
     for route in "${routes[@]}"; do
-        options=(-o Acquire::http::Timeout=8 -o Acquire::https::Timeout=8)
+        options=(-o Acquire::http::Timeout=8 -o Acquire::https::Timeout=8 -o DPkg::Lock::Timeout=60)
         if [[ $route == cn ]]; then
             arch=$(dpkg --print-architecture 2>/dev/null) || continue
             china_sources "$release" "$arch" > "$state/termlo.list" || continue
@@ -95,25 +94,133 @@ install_packages() {
             echo "APT 使用系统已配置的软件源。" >&2
         fi
         if [[ ! -f $state/$route.ready ]]; then
-            if ! "${privilege[@]}" apt-get update "${options[@]}" -o APT::Update::Error-Mode=any; then
+            if ! as_root apt-get update "${options[@]}" -o APT::Update::Error-Mode=any; then
                 echo "APT 索引获取失败，尝试其他可用源。" >&2
                 continue
             fi
             : > "$state/$route.ready"
         fi
         # Try another source only before dpkg starts changing installed packages.
-        if ! "${privilege[@]}" apt-get install --download-only -y --no-install-recommends "${options[@]}" "$@"; then
+        if ! as_root apt-get install --no-remove --reinstall --download-only -y --no-install-recommends "${options[@]}" "$@"; then
             rm -f -- "$state/$route.ready"
             echo "软件包下载失败，尝试其他可用源。" >&2
             continue
         fi
         printf '%s\n' "$route" > "$state/preferred"
-        "${privilege[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install --no-download -y \
+        as_root env DEBIAN_FRONTEND=noninteractive apt-get install --no-remove --reinstall --no-download -y \
             --no-install-recommends "${options[@]}" "$@"
         return
     done
     echo "可用的 APT 源均未能获取软件包：$*" >&2
     return 1
+}
+
+linux_manager() (
+    local release=$1
+    if [[ -r $release ]]; then
+        . "$release"
+        case " ${ID:-} ${ID_LIKE:-} " in
+            *" debian "*|*" ubuntu "*) echo apt; return ;;
+            *" alpine "*) echo apk; return ;;
+            *" fedora "*|*" rhel "*|*" centos "*|*" alinux "*|*" amzn "*) echo rpm; return ;;
+        esac
+    fi
+    if command -v apt-get >/dev/null || command -v dpkg >/dev/null; then echo apt
+    elif command -v dnf >/dev/null || command -v yum >/dev/null || command -v microdnf >/dev/null; then echo rpm
+    elif command -v apk >/dev/null; then echo apk
+    else echo "无法识别 ${PRETTY_NAME:-当前 Linux} 的系统包管理器。" >&2; return 1
+    fi
+)
+
+as_root() {
+    if (( EUID == 0 )); then "$@"
+    elif command -v sudo >/dev/null; then sudo "$@"
+    elif command -v doas >/dev/null; then doas "$@"
+    else echo "安装系统组件需要管理员权限，当前账号无法使用 sudo 或 doas。" >&2; return 1
+    fi
+}
+
+restore_apt() {
+    command -v apt-get >/dev/null && return 0
+    echo "正在恢复系统的 APT 工具。" >&2
+    if command -v apt >/dev/null; then
+        as_root apt update && as_root apt install -y --reinstall apt || return 1
+    elif command -v aptitude >/dev/null; then
+        as_root aptitude update && as_root aptitude reinstall -y apt || return 1
+    elif command -v python3 >/dev/null && python3 -c 'import apt' 2>/dev/null; then
+        as_root python3 -c 'import apt
+cache = apt.Cache()
+cache.update()
+cache.open(None)
+package = cache["apt"]
+if package.is_installed:
+    package.mark_reinstall()
+else:
+    package.mark_install()
+cache.commit()' || return 1
+    elif command -v pkcon >/dev/null; then
+        as_root pkcon --noninteractive install apt || return 1
+    else
+        echo "系统缺少 apt-get 和可用于恢复它的 APT 工具。请从此发行版的签名软件源恢复 apt 软件包，再运行同一条安装命令。" >&2
+        return 1
+    fi
+    command -v apt-get >/dev/null || { echo "恢复 apt 后仍找不到 apt-get。" >&2; return 1; }
+}
+
+install_rpm() {
+    local manager name group
+    local missing=() repair=()
+    for manager in dnf yum microdnf; do
+        command -v "$manager" >/dev/null && break
+    done
+    command -v "$manager" >/dev/null || { echo "此 RPM 系统没有可执行的 dnf、yum 或 microdnf。" >&2; return 1; }
+    for name in "$@"; do
+        if rpm -q "$name" >/dev/null 2>&1; then repair+=("$name"); else missing+=("$name"); fi
+    done
+    if (( ${#missing[@]} )); then
+        if ! as_root "$manager" -y install "${missing[@]}"; then
+            # EL keeps Chromium and Android tools in EPEL. Use distribution-provided,
+            # signed repository packages and leave other package failures visible.
+            case " ${missing[*]} " in *" chromium "*|*" android-tools "*|*" tmux "*) ;; *) return 1 ;; esac
+            [[ -r /etc/redhat-release || -r /etc/alinux-release || -r /etc/anolis-release ]] || return 1
+            as_root "$manager" -y install epel-release || {
+                [[ -r /etc/alinux-release ]] && as_root "$manager" -y install epel-aliyuncs-release
+            } || return 1
+            local extra=()
+            for group in crb powertools; do
+                if LC_ALL=C "$manager" repolist --all 2>/dev/null | awk -v id="$group" '$1 == id {found=1} END {exit !found}'; then
+                    extra+=("--enablerepo=$group")
+                    break
+                fi
+            done
+            as_root "$manager" -y "${extra[@]}" install "${missing[@]}" || return 1
+        fi
+    fi
+    if (( ${#repair[@]} )); then as_root "$manager" -y reinstall "${repair[@]}"; fi
+}
+
+linux_packages() {
+    local family=$1 region=$2 state=$3 name
+    shift 3
+    case $family in
+        apt)
+            local journal
+            for journal in /var/lib/dpkg/updates/[0-9]*; do
+                [[ -f $journal ]] || break
+                as_root env DEBIAN_FRONTEND=noninteractive dpkg --configure --pending || return 1
+                break
+            done
+            restore_apt && install_packages /etc/os-release "$region" "$state" "$@" ;;
+        rpm) install_rpm "$@" ;;
+        apk)
+            local missing=() repair=()
+            for name in "$@"; do
+                if apk info -e "$name" >/dev/null; then repair+=("$name"); else missing+=("$name"); fi
+            done
+            if (( ${#missing[@]} )); then as_root apk add --no-cache "${missing[@]}" || return 1; fi
+            if (( ${#repair[@]} )); then as_root apk fix --reinstall "${repair[@]}"; fi ;;
+        *) echo "无法使用此包管理器安装 $*。" >&2; return 1 ;;
+    esac
 }
 
 install_brew_packages() {
@@ -132,15 +239,19 @@ install_brew_packages() {
             NONINTERACTIVE=1 /bin/bash "$installer"
         )
     fi
-    if [[ $kind == cask ]]; then
-        brew install --cask --appdir="$HOME/Applications" "$@"
-    else
-        brew install "$@"
-    fi
+    local name action
+    for name in "$@"; do
+        action=install
+        if brew list --"$kind" "$name" >/dev/null 2>&1; then action=reinstall; fi
+        if [[ $kind == cask ]]; then brew "$action" --cask "--appdir=$HOME/Applications" "$name"
+        else brew "$action" --formula "$name"; fi
+    done
 }
 
 case ${1:-} in
     detect) detect_network ;;
+    manager) linux_manager "${2:-/etc/os-release}" ;;
+    linux) shift; linux_packages "$@" ;;
     apt) shift; install_packages /etc/os-release "$@" ;;
     brew) shift; install_brew_packages "$@" ;;
 esac

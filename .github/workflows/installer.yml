@@ -1,0 +1,24 @@
+name: Clean Linux installation
+on:
+  push:
+    branches: [main, 'verify-installer/**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  installation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['debian:12-slim', 'quay.io/rockylinux/rockylinux:9', 'alpine:3.22']
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install, bind over SSH and sync a file in both directions
+        run: |
+          docker run --rm --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
+            -e TERMLO_DISPOSABLE_INSTALL_TEST=1 --mount type=bind,src="$PWD",dst=/src,readonly \
+            '${{ matrix.image }}' sh /src/tests/clean-install.sh

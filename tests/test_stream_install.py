@@ -45,8 +45,6 @@ class StreamInstallTests(unittest.TestCase):
         agent.parent.mkdir(parents=True)
         agent.write_text("#!/bin/sh\necho 0.18.1\n")
         agent.chmod(0o755)
-        ca = self.home / "ca.pem"
-        ca.touch()
         (tools / "curl").write_text("""#!/bin/bash
 url=${!#}
 case $url in
@@ -61,7 +59,7 @@ esac
         (tools / "curl").chmod(0o755)
         self.env = dict(HOME=str(self.home), PATH=str(tools), XDG_CONFIG_HOME=str(self.home / "config"),
                         PYTHONDONTWRITEBYTECODE="1", PYTHONUTF8="1", TMPDIR=str(self.home),
-                        REAL_CURL=shutil.which("curl"), COUNTRY="US", CURL_CA_BUNDLE=str(ca),
+                        REAL_CURL=shutil.which("curl"), COUNTRY="US",
                         SSH_CONNECTION="10.0.0.1 51870 2606:4700:4700::1111 2202")
         if sys.platform == "linux":
             (tools / "uname").symlink_to(shutil.which("uname"))

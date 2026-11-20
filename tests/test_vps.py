@@ -55,11 +55,9 @@ class InstallerTests(unittest.TestCase):
         agent = sync_agent.installed_path()
         agent.parent.mkdir(parents=True)
         command(agent, 'echo ' + sync_agent.VERSION)
-        self.ca_bundle = self.home / "ca-certificates.crt"
-        self.ca_bundle.touch()
         release = self.home / "os-release"
         release.write_text("ID=debian\n")
-        for setting in (patch.object(termlo, "SYSTEM_CA_BUNDLE", self.ca_bundle), patch.object(termlo, "OS_RELEASE", release),
+        for setting in (patch.object(termlo, "OS_RELEASE", release),
                         patch.object(os, "geteuid", return_value=501)):
             setting.start()
             self.addCleanup(setting.stop)
@@ -139,7 +137,6 @@ if [ "$1" = install ]; then
     for tool in "$@"; do
         case "$tool" in
             git|tmux|adb|chromium) cp "$HOME/$tool" "$HOME/fixtures/$tool" ;;
-            ca-certificates) touch "$HOME/ca-certificates.crt" ;;
         esac
     done
 fi''')
@@ -196,8 +193,7 @@ SH''')
 
     def test_wizard_installs_claude_and_requires_a_working_browser_independently(self):
         self.prepare_fake_linux_tools()
-        with patch.object(wizard, "suggest_host", return_value=("dev.example.org", "检测到的地址")), \
-             patch.object(termlo, "SYSTEM_CA_BUNDLE", self.home / "ca-certificates.crt"):
+        with patch.object(wizard, "suggest_host", return_value=("dev.example.org", "检测到的地址")):
             self.wizard_install("\n\n1\n")
         self.assertTrue((self.home / ".local/bin/claude").is_file())
         self.assertTrue((self.bin / "tmux").exists())
@@ -210,8 +206,7 @@ SH''')
         self.prepare_fake_linux_tools()
         command(self.bin / "curl", 'for url do :; done; echo "$url" >> "$EVENTS"; exit 7')
         with patch.dict(os.environ, TERMLO_INSTALL_NETWORK="cn"), \
-             patch.object(wizard, "suggest_host", return_value=("dev.example.org", "当前 SSH 会话")), \
-             patch.object(termlo, "SYSTEM_CA_BUNDLE", self.key):
+             patch.object(wizard, "suggest_host", return_value=("dev.example.org", "当前 SSH 会话")):
             defaults = self.wizard_install("\n\n\n")
             self.assertNotIn("claude.ai", self.events.read_text())
             self.events.write_text("")

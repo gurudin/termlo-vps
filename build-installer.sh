@@ -10,7 +10,8 @@ trap 'rm -f -- "$stage"; if [[ -n $compat_stage ]]; then rm -f -- "$compat_stage
 
 cat > "$stage" <<'HEADER'
 #!/usr/bin/env bash
-set -euo pipefail
+set -eu
+(set -o pipefail) 2>/dev/null && set -o pipefail
 termlo_install() (
 bundle=$(mktemp -d)
 trap 'rm -rf -- "$bundle"' EXIT
@@ -39,6 +40,23 @@ PY
 cat >> "$stage" <<'FOOTER'
 
 TERMLO_ARCHIVE
+if ! command -v bash >/dev/null 2>&1; then
+    if command -v apk >/dev/null 2>&1; then set_bash_pkg=apk
+    elif command -v apt-get >/dev/null 2>&1; then set_bash_pkg=apt-get
+    elif command -v dnf >/dev/null 2>&1; then set_bash_pkg=dnf
+    elif command -v yum >/dev/null 2>&1; then set_bash_pkg=yum
+    else echo "当前系统缺少 Bash，也没有可用于安装它的包管理器。" >&2; exit 1; fi
+    install_bash() {
+        if [ "$(id -u)" = 0 ]; then "$@"
+        elif command -v sudo >/dev/null 2>&1; then sudo "$@"
+        else doas "$@"; fi
+    }
+    case $set_bash_pkg in
+        apk) install_bash apk add --no-cache bash ;;
+        apt-get) install_bash apt-get update && install_bash apt-get install -y bash ;;
+        *) install_bash "$set_bash_pkg" -y install bash ;;
+    esac
+fi
 bash "$bundle/bootstrap.sh" "$@"
 )
 termlo_install "$@"
