@@ -1,4 +1,4 @@
-"""Termlo 的 Linux VPS 安装器和用户命令。"""
+"""Termlo 远程开发环境安装器和用户命令。"""
 
 import argparse
 import fcntl
@@ -15,13 +15,16 @@ import tempfile
 import zipfile
 
 import browser
+import native_browser
 import pairing
+import sync_agent
 import wizard
 from connection_code import connection_details, encode
 
 
-SYSTEM_CA_BUNDLE = Path("/etc/ssl/certs/ca-certificates.crt")
+SYSTEM_CA_BUNDLE = Path(os.environ.get("CURL_CA_BUNDLE") or "/etc/ssl/certs/ca-certificates.crt")
 SSH_KEY_DIRECTORY = Path("/etc/ssh")
+OS_RELEASE = Path("/etc/os-release")
 
 
 def note(message):
@@ -116,22 +119,32 @@ class SystemPackages:
     def install(self, packages):
         if not packages:
             return
+        note("正在安装系统包 " + "、".join(packages))
+        if sys.platform == "darwin":
+            run_sources("brew", "formula", *packages, stdout=sys.stderr)
+            return
         if not shutil.which("apt-get") or (os.getuid() != 0 and not shutil.which("sudo")):
             raise ValueError("请先用系统包管理器安装 " + "、".join(packages) + "，再重试。")
-        note("正在安装系统包 " + "、".join(packages))
         run_sources("apt", self.region, self.state, *packages, stdout=sys.stderr)
 
+    def cask(self, name):
+        run_sources("brew", "cask", name, stdout=sys.stderr)
 
-def ensure_tmux(packages):
-    if not shutil.which("tmux"):
-        packages.install(["tmux"])
-    subprocess.run(["tmux", "-V"], stdout=sys.stderr, check=True)
+
+def claude_available():
+    path = shutil.which("claude")
+    if not path:
+        return False
+    try:
+        return subprocess.run([path, "--version"], capture_output=True, timeout=10).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
 
 def ensure_claude(packages):
-    if not shutil.which("claude"):
+    if not claude_available():
         needed = [] if shutil.which("curl") else ["curl"]
-        if not SYSTEM_CA_BUNDLE.is_file():
+        if sys.platform == "linux" and not SYSTEM_CA_BUNDLE.is_file():
             needed.append("ca-certificates")
         packages.install(needed)
         note("正在为当前 SSH 用户安装 Claude Code 稳定版…")
@@ -145,10 +158,39 @@ def ensure_claude(packages):
 
 
 def ensure_browser(packages):
-    engine = browser.available_engine()
-    if not engine:
-        packages.install(["podman", "uidmap", "slirp4netns", "fuse-overlayfs"])
-    browser.prepare_image(engine or browser.require_engine(), packages.region)
+    path = native_browser.executable()
+    if sys.platform == "darwin":
+        if not path:
+            packages.cask("google-chrome")
+    elif not path or Path(path).name == "chromium-browser":
+        ubuntu = OS_RELEASE.is_file() and any(line.strip() in ("ID=ubuntu", 'ID="ubuntu"', "ID='ubuntu'")
+                                             for line in OS_RELEASE.read_text().splitlines())
+        if ubuntu:
+            if not shutil.which("snap"):
+                packages.install(["snapd"])
+            if subprocess.run(["snap", "list", "chromium"], capture_output=True).returncode:
+                privilege = [] if os.getuid() == 0 else ["sudo"]
+                subprocess.run([*privilege, "snap", "wait", "system", "seed.loaded"], timeout=240, check=True)
+                subprocess.run([*privilege, "snap", "install", "chromium"], check=True)
+        elif not path:
+            packages.install(["chromium", "chromium-sandbox"])
+    if sys.platform == "linux" and os.geteuid() == 0:
+        note("Chromium 将使用独立的非登录账号 termlo-browser 运行。SSH 仍绑定当前账号。")
+    path = native_browser.check(prepare_root=True)
+    note(f"远程浏览器就绪，已在临时配置中启动并渲染测试页：{path}")
+
+
+def ensure_base_tools(packages):
+    required = ["git", "tmux"]
+    if sys.platform == "linux":
+        required.append("adb")
+    packages.install([name for name in required if not shutil.which(name)])
+    if sys.platform == "darwin" and not shutil.which("adb"):
+        packages.cask("android-platform-tools")
+    for command in (["git", "--version"], ["tmux", "-V"], ["adb", "version"]):
+        subprocess.run(command, stdout=sys.stderr, check=True)
+    note("正在准备并验证远程登录浏览器…")
+    ensure_browser(packages)
 
 
 def run_optional(terminal, title, description, present, action, default=1):
@@ -168,19 +210,12 @@ def run_optional(terminal, title, description, present, action, default=1):
                 return False
 
 
-def select_tools(terminal, packages):
-    note("\n2/3  选择开发工具\nSSH 连接和代码同步可以独立使用。")
-    run_optional(terminal, "tmux", "断开 SSH 后保留终端会话。",
-                 shutil.which("tmux"), lambda: ensure_tmux(packages))
+def select_claude(terminal, packages):
     mainland = packages.region == "cn"
     description = ("官方服务尚未支持中国大陆，默认跳过。选装将访问 Anthropic 官方源。" if mainland
-                   else "在 VPS 上运行 Claude Code，使用官方稳定版。")
-    has_claude = run_optional(terminal, "Claude Code", description, shutil.which("claude"),
-                              lambda: ensure_claude(packages), default=2 if mainland else 1)
-    if has_claude:
-        engine = browser.available_engine()
-        run_optional(terminal, "Claude 登录浏览器", "供 Mac 打开远端网页登录，需要容器运行时和 Chromium 镜像。",
-                     engine and browser.local_image(engine), lambda: ensure_browser(packages), default=2)
+                   else "在当前远程设备上运行官方稳定版。")
+    run_optional(terminal, "Claude Code", description, claude_available(),
+                 lambda: ensure_claude(packages), default=2 if mainland else 1)
 
 
 def install_cli():
@@ -195,7 +230,8 @@ def install_cli():
             with stage.open("wb") as output:
                 output.write(b"#!/usr/bin/env python3\n")
                 with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED, strict_timestamps=False) as bundle:
-                    for name in ("termlo.py", "connection_code.py", "pairing.py", "browser.py", "wizard.py", "sources.sh"):
+                    for name in ("termlo.py", "connection_code.py", "pairing.py", "browser.py", "native_browser.py",
+                                 "sync_agent.py", "wizard.py", "sources.sh"):
                         bundle.write(Path(__file__).with_name(name), name)
                     bundle.writestr("__main__.py", "from termlo import main\nmain()\n")
         stage.chmod(0o755)
@@ -206,33 +242,42 @@ def install_cli():
 
 
 def install(args, terminal=None):
-    if sys.platform != "linux":
-        raise ValueError("请在 VPS 的 Linux SSH 会话中运行安装器。")
+    if sys.platform not in ("linux", "darwin"):
+        raise ValueError("请在远程 macOS 或 Linux 设备上安装 Termlo。")
+    if sys.platform == "darwin" and os.getuid() == 0:
+        raise ValueError("请用平时连接远程 Mac 的普通账号运行安装器。")
     if os.getuid() == 0 and os.environ.get("SUDO_USER") not in (None, "", "root"):
         raise ValueError("请用目标 SSH 账号直接运行安装器，安装系统包时会自动调用 sudo。")
     os.environ["PATH"] = f"{Path.home()}/.local/bin:{Path.home()}/.npm-global/bin:" + os.environ["PATH"]
+    if sys.platform == "darwin":
+        os.environ["PATH"] += ":/opt/homebrew/bin:/usr/local/bin"
     folder = config_dir()
     folder.mkdir(mode=0o700, parents=True, exist_ok=True)
     with (folder / "install.lock").open("a") as lock, tempfile.TemporaryDirectory(prefix="termlo-apt-") as state:
         fcntl.flock(lock, fcntl.LOCK_EX)
         region, egress = install_network()
-        channels = {"cn": "中国大陆，优先使用国内镜像", "global": "海外，优先使用系统源和官方镜像",
-                    "auto": "未识别到出口地区，优先使用系统源，下载失败时尝试国内镜像"}
+        channels = {"cn": "中国大陆，APT 优先使用国内镜像", "global": "海外，优先使用系统源和官方源",
+                    "auto": "未识别到出口地区，优先使用系统源"}
         note("下载线路：" + channels[region])
         packages = SystemPackages(region, state)
-        if not shutil.which("ssh-keygen") or not shutil.which("scp"):
-            packages.install(["openssh-client"])
+        if any(not shutil.which(tool) for tool in ("ssh", "scp", "ssh-keygen")):
+            packages.install(["openssh" if sys.platform == "darwin" else "openssh-client"])
         settings = connection_settings(args, terminal, region, egress)
         details = connection_details(**settings, include_host_key=True)
-        if terminal is not None:
-            select_tools(terminal, packages)
-        elif not args.sync_only:
-            # Preserve the original full installation for existing unattended commands.
-            if not shutil.which("git"):
-                packages.install(["git"])
-            ensure_tmux(packages)
-            ensure_claude(packages)
-            ensure_browser(packages)
+        note("\n2/3  准备远程开发环境")
+        if not shutil.which("curl"):
+            packages.install(["curl"])
+        if sys.platform == "linux" and not SYSTEM_CA_BUNDLE.is_file():
+            packages.install(["ca-certificates"])
+        note(f"正在准备 Mutagen {sync_agent.VERSION} 远端同步代理…")
+        agent = sync_agent.install()
+        note(f"双向同步的远端代理已就绪：{agent}")
+        if not args.sync_only:
+            ensure_base_tools(packages)
+            if terminal is not None:
+                select_claude(terminal, packages)
+            elif args.claude is not False:
+                ensure_claude(packages)
         install_cli()
         with tempfile.NamedTemporaryFile(dir=folder, mode="w", encoding="utf-8", delete=False) as out:
             json.dump(settings, out, ensure_ascii=False)
@@ -255,14 +300,19 @@ def add_endpoint_options(parser):
 def main():
     parser = argparse.ArgumentParser(prog="termlo", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    setup = commands.add_parser("install", help="安装或更新当前用户的 VPS 开发环境")
+    setup = commands.add_parser("install", help="安装或更新当前用户的远程开发环境")
     add_endpoint_options(setup)
-    setup.add_argument("--sync-only", action="store_true", help="仅准备 SSH 和代码同步")
+    mode = setup.add_mutually_exclusive_group()
+    mode.add_argument("--sync-only", action="store_true", help="仅准备 SSH 和远端同步代理")
+    mode.add_argument("--without-claude", dest="claude", action="store_false", default=None,
+                      help="安装全部基础工具，跳过 Claude Code")
+    mode.add_argument("--with-claude", dest="claude", action="store_true", default=None,
+                      help="安装全部基础工具和 Claude Code")
     add_endpoint_options(commands.add_parser("connection-code", help="生成可绑定一台 Mac 的新连接码"))
     redeem = commands.add_parser("redeem", help=argparse.SUPPRESS)
     redeem.add_argument("ticket")
     login = commands.add_parser("browser", help="临时打开或关闭 Claude 登录浏览器")
-    login.add_argument("action", choices=["start", "stop"])
+    login.add_argument("action", choices=["start", "stop", "check"], help="check 启动原生浏览器并验证页面渲染")
     login.add_argument("--session", type=browser.session_id, help="由 Mac 客户端分配的会话 UUID")
     args = parser.parse_args()
     try:
@@ -270,7 +320,7 @@ def main():
             try:
                 terminal = open("/dev/tty", "r", encoding="utf-8")
             except OSError:
-                raise ValueError("安装向导需要交互终端。请在 VPS 控制台或交互式 SSH 会话中运行。") from None
+                raise ValueError("安装向导需要交互终端。请在设备控制台或交互式 SSH 会话中运行。") from None
             with terminal:
                 install(args, terminal)
         elif args.command == "install":
@@ -280,6 +330,8 @@ def main():
             print(encode(dict(details, version=2, pairing=pairing.issue())))
         elif args.command == "redeem":
             print(pairing.redeem(args.ticket, os.environ.get("SSH_ORIGINAL_COMMAND", "")))
+        elif args.action == "check":
+            print("原生浏览器可启动并渲染测试页：" + native_browser.check())
         else:
             browser.manage(args.action, args.session, config_dir())
     except (EOFError, KeyboardInterrupt):

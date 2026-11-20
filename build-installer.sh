@@ -28,7 +28,8 @@ source = Path(sys.argv[1])
 payload = io.BytesIO()
 with gzip.GzipFile(fileobj=payload, mode="wb", mtime=0) as compressed:
     with tarfile.open(fileobj=compressed, mode="w", format=tarfile.USTAR_FORMAT) as archive:
-        for name in ("bootstrap.sh", "sources.sh", "termlo.py", "connection_code.py", "pairing.py", "browser.py", "wizard.py"):
+        for name in ("bootstrap.sh", "sources.sh", "termlo.py", "connection_code.py", "pairing.py", "browser.py",
+                     "native_browser.py", "sync_agent.py", "wizard.py"):
             data = (source / name).read_bytes()
             member = tarfile.TarInfo(name)
             member.size = len(data)

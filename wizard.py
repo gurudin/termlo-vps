@@ -53,7 +53,7 @@ def public_egress_address(region="global"):
 
 
 def suggest_host(ssh_address, region="global", egress=None):
-    if ssh_address and ssh_address.is_global and usable_address(ssh_address):
+    if ssh_address and usable_address(ssh_address) and (ssh_address.is_global or sys.platform == "darwin"):
         return str(ssh_address), "当前 SSH 会话"
     addresses = local_addresses()
     for address in addresses:

@@ -34,9 +34,19 @@ class StreamInstallTests(unittest.TestCase):
         subprocess.run(["bash", str(ROOT / "build-installer.sh"), str(self.bundle)], check=True)
         tools = self.home / "bin"
         tools.mkdir()
-        for name in ("bash", "base64", "tar", "dirname", "id", "mktemp", "rm", "scp", "ssh-keygen"):
+        for name in ("bash", "base64", "tar", "dirname", "id", "mktemp", "rm", "ssh", "scp", "ssh-keygen"):
             (tools / name).symlink_to(shutil.which(name))
         (tools / "python3").symlink_to(sys.executable)
+        for name in ("git", "tmux", "adb", "chromium"):
+            tool = tools / name
+            tool.write_text("#!/bin/sh\n" + ("echo '<title>termlo-browser-ready</title>'\n" if name == "chromium" else "exit 0\n"))
+            tool.chmod(0o755)
+        agent = self.home / ".mutagen/agents/0.18.1/mutagen-agent"
+        agent.parent.mkdir(parents=True)
+        agent.write_text("#!/bin/sh\necho 0.18.1\n")
+        agent.chmod(0o755)
+        ca = self.home / "ca.pem"
+        ca.touch()
         (tools / "curl").write_text("""#!/bin/bash
 url=${!#}
 case $url in
@@ -51,7 +61,7 @@ esac
         (tools / "curl").chmod(0o755)
         self.env = dict(HOME=str(self.home), PATH=str(tools), XDG_CONFIG_HOME=str(self.home / "config"),
                         PYTHONDONTWRITEBYTECODE="1", PYTHONUTF8="1", TMPDIR=str(self.home),
-                        REAL_CURL=shutil.which("curl"), COUNTRY="US",
+                        REAL_CURL=shutil.which("curl"), COUNTRY="US", CURL_CA_BUNDLE=str(ca),
                         SSH_CONNECTION="10.0.0.1 51870 2606:4700:4700::1111 2202")
         if sys.platform == "linux":
             (tools / "uname").symlink_to(shutil.which("uname"))
@@ -59,8 +69,8 @@ esac
             # Exercise the Linux installer on the Mac development machine without installing system packages.
             (tools / "uname").write_text("#!/bin/sh\necho Linux\n")
             (tools / "uname").chmod(0o755)
-            (tools / "sitecustomize.py").write_text("import sys\nsys.platform = 'linux'\n")
-            self.env["PYTHONPATH"] = str(tools)
+        (tools / "sitecustomize.py").write_text("import os, sys\nsys.platform = 'linux'\nos.geteuid = lambda: 501\n")
+        self.env["PYTHONPATH"] = str(tools)
         key = self.home / "host_key"
         subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)], check=True)
         config = self.home / "config/termlo"
@@ -90,7 +100,7 @@ esac
                     break
                 output.extend(chunk)
                 if not answered and "[2606:4700:4700::1111]".encode() in output:
-                    os.write(master, b"\n\n2\n2\n")
+                    os.write(master, b"\n\n2\n")
                     answered = True
         finally:
             os.close(master)

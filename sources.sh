@@ -116,7 +116,31 @@ install_packages() {
     return 1
 }
 
+install_brew_packages() {
+    local kind=$1
+    shift
+    export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+    if ! command -v brew >/dev/null; then
+        echo "正在为当前 Mac 准备 Homebrew。" >&2
+        (
+            installer=$(mktemp)
+            trap 'rm -f -- "$installer"' EXIT
+            curl --proto '=https' --proto-redir '=https' -fsSL --retry 2 -o "$installer" \
+                https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh
+            # Authenticate through the user's terminal before the noninteractive bootstrap.
+            if ! sudo -n -v 2>/dev/null; then sudo -v; fi
+            NONINTERACTIVE=1 /bin/bash "$installer"
+        )
+    fi
+    if [[ $kind == cask ]]; then
+        brew install --cask --appdir="$HOME/Applications" "$@"
+    else
+        brew install "$@"
+    fi
+}
+
 case ${1:-} in
     detect) detect_network ;;
     apt) shift; install_packages /etc/os-release "$@" ;;
+    brew) shift; install_brew_packages "$@" ;;
 esac

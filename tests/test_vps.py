@@ -1,6 +1,6 @@
 import argparse
 import base64
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import redirect_stdout
 import io
 import json
 import os
@@ -16,6 +16,8 @@ import uuid
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import browser
+import native_browser
+import sync_agent
 import termlo
 import wizard
 
@@ -46,13 +48,25 @@ class InstallerTests(unittest.TestCase):
         platform = patch.object(sys, "platform", "linux")
         platform.start()
         self.addCleanup(platform.stop)
-        for name in ("env", "bash", "ssh-keygen", "scp", "mkdir", "cp", "cat", "chmod", "touch", "sh"):
+        for name in ("env", "bash", "ssh", "ssh-keygen", "scp", "mkdir", "mktemp", "rm", "cp", "cat", "chmod", "touch", "sh"):
             (self.bin / name).symlink_to(shutil.which(name, path="/usr/bin:/bin"))
         (self.bin / "python3").symlink_to(sys.executable)
+        command(self.bin / "curl", 'exit 1')
+        agent = sync_agent.installed_path()
+        agent.parent.mkdir(parents=True)
+        command(agent, 'echo ' + sync_agent.VERSION)
+        self.ca_bundle = self.home / "ca-certificates.crt"
+        self.ca_bundle.touch()
+        release = self.home / "os-release"
+        release.write_text("ID=debian\n")
+        for setting in (patch.object(termlo, "SYSTEM_CA_BUNDLE", self.ca_bundle), patch.object(termlo, "OS_RELEASE", release),
+                        patch.object(os, "geteuid", return_value=501)):
+            setting.start()
+            self.addCleanup(setting.stop)
 
     def install(self, sync_only=True, terminal=None, **kwargs):
         args = dict(host="dev.example.org", port=2207, host_key=self.public,
-                    name="开发机", sync_only=sync_only)
+                    name="开发机", sync_only=sync_only, claude=None)
         args.update(kwargs)
         output = io.StringIO()
         with redirect_stdout(output):
@@ -112,22 +126,19 @@ class InstallerTests(unittest.TestCase):
 
     def prepare_fake_linux_tools(self):
         command(self.bin / "sudo", 'exec "$@"')
-        for name in ("tmux", "git", "claude"):
+        for name in ("tmux", "git", "adb", "claude"):
             command(self.home / name, 'exit 0')
-        command(self.home / "podman", '''
-case "$1" in
-    info) exit 0 ;;
-    image) test -f "$HOME/image" ;;
-    pull) echo pull >> "$EVENTS"; test ! -e "$HOME/fail-pull"; touch "$HOME/image" ;;
-    *) exit 1 ;;
-esac''')
+        command(self.home / "chromium", '''
+case " $* " in *" --no-sandbox "*) exit 1 ;; *" --dump-dom "*) ;; *) exit 1 ;; esac
+test ! -e "$HOME/fail-browser"
+echo '<html><head><title>termlo-browser-ready</title></head></html>' ''')
         command(self.bin / "apt-get", '''
 echo "apt $*" >> "$EVENTS"
 case " $* " in *" --download-only "*) exit 0 ;; esac
 if [ "$1" = install ]; then
     for tool in "$@"; do
         case "$tool" in
-            git|tmux|podman) cp "$HOME/$tool" "$HOME/fixtures/$tool" ;;
+            git|tmux|adb|chromium) cp "$HOME/$tool" "$HOME/fixtures/$tool" ;;
             ca-certificates) touch "$HOME/ca-certificates.crt" ;;
         esac
     done
@@ -144,64 +155,56 @@ cp "$HOME/claude" "$HOME/.local/bin/claude"
 SH''')
 
     def test_full_first_install_retry_and_reuse(self):
-        bundle = patch.object(termlo, "SYSTEM_CA_BUNDLE", self.home / "ca-certificates.crt")
-        bundle.start()
-        self.addCleanup(bundle.stop)
         self.prepare_fake_linux_tools()
-        fail = self.home / "fail-pull"
+        fail = self.home / "fail-browser"
         fail.touch()
-        with self.assertRaises(subprocess.CalledProcessError):
+        with self.assertRaisesRegex(ValueError, "渲染测试页"):
             self.install(sync_only=False)
         self.assertFalse(self.cli.exists())
         self.assertFalse((termlo.config_dir() / "connection.json").exists())
         fail.unlink()
         code = self.install(sync_only=False)
         events = self.events.read_text()
-        self.assertIn("tmux", events)
+        for name in ("git", "tmux", "adb", "chromium"):
+            self.assertIn(name, events)
         self.assertEqual(events.count("claude\n"), 1)
-        self.assertEqual(events.count("pull\n"), 3)
+        self.assertNotIn("podman", events)
         self.assertEqual(self.decode(self.install(sync_only=False, host=None, port=None, host_key=None, name=None)), self.decode(code))
         self.assertEqual(self.events.read_text(), events)
 
     def wizard_install(self, answers):
-        return self.decode(self.install(terminal=io.StringIO(answers), host=None, port=None, name=None))
+        return self.decode(self.install(sync_only=False, terminal=io.StringIO(answers), host=None, port=None, name=None))
 
-    def test_wizard_retries_invalid_fields_and_skips_all_optional_tools(self):
+    def test_wizard_retries_invalid_fields_and_skips_claude_only(self):
+        self.prepare_fake_linux_tools()
         with patch.object(wizard, "suggest_host", return_value=(None, "请填写地址")):
-            result = self.wizard_install("\nhttps://bad.example\n[2001:db8::54]\n70000\n3456\n2\n2\n")
+            result = self.wizard_install("\nhttps://bad.example\n[2001:db8::54]\n70000\n3456\n2\n")
         self.assertEqual((result["host"], result["port"]), ("2001:db8::54", 3456))
-        self.assertEqual(self.events.read_text(), "")
+        self.assertTrue((self.bin / "chromium").exists())
+        self.assertFalse((self.home / ".local/bin/claude").exists())
 
-    def test_wizard_accepts_ssh_defaults_and_installs_only_the_chosen_tool(self):
+    def test_wizard_accepts_ssh_defaults_and_reuses_required_tools(self):
         self.prepare_fake_linux_tools()
         with patch.dict(os.environ, SSH_CONNECTION="10.0.0.1 50000 2606:4700:4700::1111 2200"):
-            result = self.wizard_install("\n\n\n2\n")
+            result = self.wizard_install("\n\n2\n")
         self.assertEqual((result["host"], result["port"]), ("2606:4700:4700::1111", 2200))
-        operations = self.events.read_text().splitlines()
-        self.assertEqual(len(operations), 3)
-        self.assertTrue(operations[0].startswith("apt update "))
-        self.assertIn(" --download-only ", operations[1])
-        self.assertIn(" --no-download ", operations[2])
-        self.assertTrue(all(op.endswith(" tmux") for op in operations[1:]))
+        operations = self.events.read_text()
+        self.assertIn("chromium", operations)
         with patch.object(wizard, "suggest_host", side_effect=AssertionError("should reuse saved address")):
             self.assertEqual(self.wizard_install("\n\n2\n"), result)
+        self.assertEqual(operations, self.events.read_text())
 
-    def test_wizard_claude_only_and_optional_browser(self):
+    def test_wizard_installs_claude_and_requires_a_working_browser_independently(self):
         self.prepare_fake_linux_tools()
         with patch.object(wizard, "suggest_host", return_value=("dev.example.org", "检测到的地址")), \
              patch.object(termlo, "SYSTEM_CA_BUNDLE", self.home / "ca-certificates.crt"):
-            self.wizard_install("\n\n2\n1\n\n")
+            self.wizard_install("\n\n1\n")
         self.assertTrue((self.home / ".local/bin/claude").is_file())
-        self.assertFalse((self.bin / "tmux").exists())
+        self.assertTrue((self.bin / "tmux").exists())
         self.assertFalse((self.bin / "podman").exists())
-        (self.home / "fail-pull").touch()
-        with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as messages:
-            with redirect_stderr(messages):
-                result = self.wizard_install("\n\n2\n1\n2\n")
-            messages.seek(0)
-            self.assertIn("登录浏览器 安装失败", messages.read())
-        self.assertEqual(result["host"], "dev.example.org")
-        self.assertIn("pull", self.events.read_text().splitlines())
+        (self.home / "fail-browser").touch()
+        with self.assertRaisesRegex(ValueError, "渲染测试页"):
+            self.wizard_install("\n\n")
 
     def test_china_claude_is_optional_and_uses_only_the_official_installer(self):
         self.prepare_fake_linux_tools()
@@ -209,9 +212,10 @@ SH''')
         with patch.dict(os.environ, TERMLO_INSTALL_NETWORK="cn"), \
              patch.object(wizard, "suggest_host", return_value=("dev.example.org", "当前 SSH 会话")), \
              patch.object(termlo, "SYSTEM_CA_BUNDLE", self.key):
-            defaults = self.wizard_install("\n\n2\n\n")
-            self.assertEqual(self.events.read_text(), "")
-            explicit = self.wizard_install("\n\n2\n1\n\n")
+            defaults = self.wizard_install("\n\n\n")
+            self.assertNotIn("claude.ai", self.events.read_text())
+            self.events.write_text("")
+            explicit = self.wizard_install("\n\n1\n2\n")
         self.assertEqual(defaults, explicit)
         self.assertEqual(self.events.read_text().splitlines(), ["https://claude.ai/install.sh"])
 
@@ -225,11 +229,16 @@ SH''')
 class HostDetectionTests(unittest.TestCase):
     def test_private_ssh_suggests_egress_or_local_address_when_offline(self):
         private = termlo.ipaddress.ip_address("10.1.2.3")
-        with patch.object(wizard, "local_addresses", return_value=[]), \
+        with patch.object(sys, "platform", "linux"), patch.object(wizard, "local_addresses", return_value=[]), \
              patch.object(wizard, "public_egress_address", side_effect=["8.8.8.8", None, None]):
             self.assertEqual(wizard.suggest_host(private)[0], "8.8.8.8")
             self.assertEqual(wizard.suggest_host(private)[0], str(private))
             self.assertIsNone(wizard.suggest_host(None)[0])
+
+    def test_remote_mac_prefers_the_address_of_its_current_ssh_connection(self):
+        private = termlo.ipaddress.ip_address("192.168.1.8")
+        with patch.object(sys, "platform", "darwin"), patch.object(wizard, "public_egress_address", side_effect=AssertionError):
+            self.assertEqual(wizard.suggest_host(private), (str(private), "当前 SSH 会话"))
 
     def test_direct_ssh_and_public_interface_avoid_external_lookup(self):
         address = termlo.ipaddress.ip_address("2606:4700:4700::1111")

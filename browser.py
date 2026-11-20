@@ -3,6 +3,7 @@
 import argparse
 import base64
 import fcntl
+import hashlib
 import http.client
 import json
 import os
@@ -21,6 +22,11 @@ IMAGE = "lscr.io/linuxserver/chromium@" + IMAGE_DIGEST
 CN_IMAGE = "docker.m.daocloud.io/linuxserver/chromium@" + IMAGE_DIGEST
 LEGACY_IMAGE = "lscr.io/linuxserver/chromium:latest"
 LABEL = "io.termlo.login"
+CLAUDE_HOME = "https://claude.ai/"
+
+
+class BrowserError(ValueError):
+    """A user-facing diagnostic that can be returned without container output or credentials."""
 
 
 def session_id(value):
@@ -30,7 +36,7 @@ def session_id(value):
         raise argparse.ArgumentTypeError("会话 ID 应为 UUID") from None
 
 
-def available_engine():
+def available_engine(timeout=None):
     for engine in ("podman", "docker"):
         if not shutil.which(engine):
             continue
@@ -39,13 +45,13 @@ def available_engine():
             endpoint = os.environ.get("DOCKER_HOST")
             if not endpoint or os.environ.get("DOCKER_CONTEXT"):
                 current = subprocess.run(["docker", "context", "inspect", "--format", "{{.Endpoints.docker.Host}}"],
-                                         capture_output=True, text=True)
+                                         capture_output=True, text=True, timeout=timeout)
                 endpoint = current.stdout.strip()
             if not endpoint.startswith("unix://"):
                 continue
         elif os.environ.get("CONTAINER_HOST") or os.environ.get("CONTAINER_CONNECTION"):
             continue
-        info = subprocess.run([engine, "info"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        info = subprocess.run([engine, "info"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout)
         if info.returncode == 0:
             return engine
     return None
@@ -54,14 +60,14 @@ def available_engine():
 def require_engine():
     engine = available_engine()
     if not engine:
-        raise ValueError("当前 SSH 用户无法运行 Podman 或 Docker。请在 VPS 安装向导中选择「Claude 登录浏览器」。")
+        raise BrowserError("旧版容器浏览器需要可用的 Podman 或 Docker。请用 termlo browser check 核验原生浏览器。")
     return engine
 
 
-def local_image(engine):
+def local_image(engine, timeout=None):
     for image in (IMAGE, CN_IMAGE, LEGACY_IMAGE):
         if subprocess.run([engine, "image", "inspect", image], stdout=subprocess.DEVNULL,
-                          stderr=subprocess.DEVNULL).returncode == 0:
+                          stderr=subprocess.DEVNULL, timeout=timeout).returncode == 0:
             return image
     return None
 
@@ -94,41 +100,45 @@ def inspect_container(engine, name, owner):
 def credentials(container):
     bindings = (container["NetworkSettings"].get("Ports") or {}).get("3001/tcp") or []
     if len(bindings) != 1 or bindings[0]["HostIp"] != "127.0.0.1":
-        raise ValueError("登录浏览器的 HTTPS 端口必须只绑定 VPS 回环地址。")
+        raise BrowserError("登录浏览器的 HTTPS 端口必须只绑定 VPS 回环地址。")
     env = dict(item.split("=", 1) for item in container["Config"]["Env"] if "=" in item)
     if env.get("CUSTOM_USER") != "termlo" or not env.get("PASSWORD"):
-        raise ValueError("登录浏览器缺少会话凭据。")
+        raise BrowserError("登录浏览器缺少会话凭据。")
     return dict(port=int(bindings[0]["HostPort"]), user="termlo", password=env["PASSWORD"])
 
 
-def wait_until_ready(access):
+def wait_until_ready(access, *, pin_certificate=False):
     # The image serves a self-signed certificate. This probe only targets its local published port.
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
     auth = base64.b64encode(f"{access['user']}:{access['password']}".encode()).decode()
-    def request(headers):
+    def request(headers, *, fingerprint=False):
         connection = http.client.HTTPSConnection("127.0.0.1", access["port"], timeout=2, context=context)
         try:
             connection.request("GET", "/", headers=headers)
-            return connection.getresponse().status
+            certificate = connection.sock.getpeercert(binary_form=True) if fingerprint else None
+            return connection.getresponse().status, certificate
         finally:
             connection.close()
 
     deadline = time.monotonic() + 70
     while time.monotonic() < deadline:
         try:
-            if 200 <= request({"Authorization": "Basic " + auth}) < 400:
-                if request({}) == 401:
-                    return
-                raise ValueError("登录浏览器允许匿名访问，已拒绝打开。")
+            status, certificate = request({"Authorization": "Basic " + auth}, fingerprint=pin_certificate)
+            if 200 <= status < 400:
+                anonymous_status, _ = request({})
+                if anonymous_status == 401:
+                    # The Mac pins the certificate from the authenticated connection, returned over SSH.
+                    return hashlib.sha256(certificate).hexdigest() if pin_certificate else None
+                raise BrowserError("登录浏览器允许匿名访问，已拒绝打开。")
         except (OSError, http.client.HTTPException):
             pass
         time.sleep(0.5)
-    raise ValueError("Chromium 在 70 秒内未就绪，请核对 VPS 可用内存和容器运行时。")
+    raise BrowserError("Chromium 在 70 秒内未就绪，请核对 VPS 可用内存和容器运行时。")
 
 
-def manage(action, session, folder):
+def manage(action, session, folder, *, open_claude=False):
     engine = require_engine()
     owner = f"{os.getuid()}-{session or 'default'}"
     name = "termlo-login-" + owner
@@ -148,12 +158,13 @@ def manage(action, session, folder):
         if not container:
             image = local_image(engine)
             if not image:
-                raise ValueError("尚未准备 Chromium 镜像。请在 VPS 安装向导中选择「Claude 登录浏览器」。")
+                raise BrowserError("这台设备没有旧版容器浏览器镜像。请用 termlo browser check 核验原生浏览器。")
             # The legacy client forwards port 3001. Named sessions each get a free loopback port.
             publish = "127.0.0.1::3001" if session else "127.0.0.1:3001:3001"
+            initial_page = ["-e", "CHROME_CLI=" + CLAUDE_HOME] if open_claude else []
             result = subprocess.run([engine, "run", "-d", "--rm", "--pull=never", "--name", name,
                                      "--label", f"{LABEL}={owner}", "-p", publish, "--shm-size=1g",
-                                     "-e", "CUSTOM_USER=termlo", "-e", "PASSWORD", image],
+                                     "-e", "CUSTOM_USER=termlo", "-e", "PASSWORD", *initial_page, image],
                                     env=dict(os.environ, PASSWORD=secrets.token_urlsafe(24)),
                                     stdout=subprocess.PIPE, text=True, check=True)
             created = result.stdout.strip()
@@ -161,9 +172,11 @@ def manage(action, session, folder):
             if created:
                 container = inspect_container(engine, name, owner)
             if not container:
-                raise ValueError("登录容器启动后已退出。")
+                raise BrowserError("登录容器启动后已退出。")
             access = credentials(container)
-            wait_until_ready(access)
+            fingerprint = wait_until_ready(access, pin_certificate=open_claude)
+            if open_claude:
+                access["certificateSHA256"] = fingerprint
         except BaseException:
             if created:
                 subprocess.run([engine, "rm", "-f", "-v", created], stdout=sys.stderr, stderr=subprocess.DEVNULL)
