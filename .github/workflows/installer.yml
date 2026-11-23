@@ -54,3 +54,9 @@ jobs:
             grep -q '^termlo://connect/' "$RUNNER_TEMP/code"
           done
           "$HOME/.local/bin/termlo" browser check
+      - name: Render with an empty Mac home and no login keychain
+        if: runner.os == 'macOS'
+        run: |
+          cli="$HOME/.local/bin/termlo"
+          probe_home=$(mktemp -d "$RUNNER_TEMP/termlo-keychain.XXXXXXXX")
+          HOME="$probe_home" CFFIXED_USER_HOME="$probe_home" "$cli" browser check </dev/null

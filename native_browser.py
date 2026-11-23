@@ -69,16 +69,18 @@ PROBE = """
 set -eu
 umask 077
 cd "$HOME"
+browser=$1
+shift
 base=$HOME
 if [ -x /snap/bin/chromium ]; then
-    case "$1" in
+    case "$browser" in
         /snap/bin/chromium|*/chromium-browser) base="$HOME/snap/chromium/common"; mkdir -p "$base" ;;
     esac
 fi
 profile=$(mktemp -d "$base/termlo-browser-check.XXXXXXXX")
 trap 'rm -rf -- "$profile"' EXIT
 trap 'exit 1' HUP INT TERM
-"$1" --headless --disable-gpu --disable-dev-shm-usage --no-first-run --no-default-browser-check \
+"$browser" "$@" --headless --disable-gpu --disable-dev-shm-usage --no-first-run --no-default-browser-check \
     --disable-background-networking --disable-component-update --user-data-dir="$profile" \
     --dump-dom 'data:text/html,<title>termlo-browser-ready</title>'
 """
@@ -158,6 +160,9 @@ def render_candidates(paths, prefix):
 
 def render_page(path, prefix, timeout):
     command = [*prefix, "bash", "-c", PROBE, "termlo-browser-check", path]
+    if sys.platform == "darwin":
+        # An SSH session may have no unlocked login keychain. This throwaway page needs no credentials.
+        command.append("--use-mock-keychain")
     process = subprocess.Popen(command, cwd="/", stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                start_new_session=True, text=True, errors="replace")
     try:

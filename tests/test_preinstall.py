@@ -111,6 +111,26 @@ class ToolPathTests(unittest.TestCase):
 
 
 class BrowserInstallTests(unittest.TestCase):
+    def test_disposable_mac_render_uses_the_mock_keychain(self):
+        with tempfile.TemporaryDirectory() as home:
+            folder = Path(home)
+            browser = folder / "Test Browser"
+            browser.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$HOME/arguments\"\n"
+                               "echo '<title>termlo-browser-ready</title>'\n")
+            browser.chmod(0o700)
+            for platform in ("darwin", "linux"):
+                with self.subTest(platform=platform), patch.dict(os.environ, HOME=home), \
+                     patch.object(sys, "platform", platform), patch.object(os, "geteuid", return_value=501), \
+                     patch.object(native_browser, "candidates", return_value=[str(browser)]):
+                    for check in (native_browser.check_for_install, native_browser.check):
+                        self.assertEqual(check(), str(browser))
+                        arguments = (folder / "arguments").read_text().splitlines()
+                        self.assertEqual("--use-mock-keychain" in arguments, platform == "darwin")
+                        self.assertIn("--headless", arguments)
+                        profile, = [arg.split("=", 1)[1] for arg in arguments if arg.startswith("--user-data-dir=")]
+                        self.assertEqual(Path(profile).parent, folder)
+                        self.assertFalse(Path(profile).exists())
+
     def test_remote_mac_installs_native_browser_and_platform_tools_with_homebrew(self):
         packages = Mock()
         with patch.object(sys, "platform", "darwin"), patch("shutil.which", return_value=None), \
