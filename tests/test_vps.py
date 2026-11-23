@@ -268,6 +268,8 @@ test "$3" = https://claude.ai/install.sh
 cat > "$2" <<'SH'
 set -eu
 test "$1" = stable
+test -p /dev/stdin
+if IFS= read -r answer; then exit 4; fi
 echo claude >> "$EVENTS"
 mkdir -p "$HOME/.local/bin"
 cp "$HOME/claude" "$HOME/.local/bin/claude"
@@ -419,6 +421,23 @@ class HostDetectionTests(unittest.TestCase):
             self.assertEqual(wizard.suggest_host(private)[0], "8.8.8.8")
             self.assertEqual(wizard.suggest_host(private)[0], str(private))
             self.assertIsNone(wizard.suggest_host(None)[0])
+
+    def test_linux_ssh_wizard_uses_the_private_session_or_the_public_nat_endpoint(self):
+        args = argparse.Namespace(host=None, port=None, name=None, host_key=None)
+        cases = [
+            ("192.168.10.4", "192.168.10.8", "192.168.10.8"),
+            ("fd42::4", "fd42::8", "fd42::8"),
+            ("100.64.0.4", "100.64.0.8", "100.64.0.8"),
+            ("1.0.0.1", "192.168.10.8", "8.8.8.8"),
+            ("unknown", "192.168.10.8", "8.8.8.8"),
+        ]
+        with tempfile.TemporaryDirectory() as home, patch.dict(os.environ, HOME=home, XDG_CONFIG_HOME=home), \
+             patch.object(sys, "platform", "linux"), patch.object(wizard, "local_addresses", return_value=[]):
+            for client, server, expected in cases:
+                with self.subTest(client=client), redirect_stderr(io.StringIO()), \
+                     patch.dict(os.environ, SSH_CONNECTION=f"{client} 50123 {server} 2222"):
+                    settings = termlo.connection_settings(args, io.StringIO("\n\n"), egress="8.8.8.8")
+                    self.assertEqual((settings["host"], settings["port"]), (expected, 2222))
 
     def test_remote_mac_prefers_the_address_of_its_current_ssh_connection(self):
         private = termlo.ipaddress.ip_address("192.168.1.8")

@@ -20,6 +20,37 @@ ED25519_PREFIX = b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20"
 RECEIPT = "termlo-paired-v2"
 
 
+def check_authorization_directories():
+    try:
+        home = Path.home().resolve()
+        ssh = home / ".ssh"
+        paths = {home: '"$HOME"', ssh.resolve(): '"$HOME/.ssh"'}
+        # StrictModes walks the real path of authorized_keys, stopping at the
+        # account home (or at the root for a link outside the account home).
+        for parent in (ssh / "authorized_keys").resolve().parents:
+            paths.setdefault(parent, shlex.quote(str(parent)))
+            if parent == home:
+                break
+    except (OSError, RuntimeError) as error:
+        raise ValueError("请检查 ~/.ssh 和 authorized_keys 的链接是否循环、当前账号能否访问链接目标。") from error
+
+    problems = []
+    for path, label in paths.items():
+        if not path.is_dir():
+            continue
+        info = path.stat()
+        if info.st_uid not in (0, os.getuid()):
+            problems.append(f"{label} 属于其他账号。请让管理员核对所有者，将 SSH 授权文件保存在该账号的专用目录。")
+        elif info.st_mode & 0o022:
+            if path != home and home not in path.parents:
+                problems.append(f"SSH 授权文件经过可被其他用户写入的外部目录 {label}。请将授权文件迁入账号的专用目录并更新链接。")
+            else:
+                command = "chmod" if info.st_uid == os.getuid() else "sudo chmod"
+                problems.append(f"{label} 允许组或其他用户写入。请收紧目录权限后重试：\n             {command} go-w {label}")
+    if problems:
+        raise ValueError("\n           ".join(problems))
+
+
 def account_file(path, *, replace):
     """Check a lock opened for append or a key file updated by atomic rename."""
     try:
@@ -126,6 +157,7 @@ def ssh_expiry_time(expires, utc_expiry):
 
 @contextmanager
 def pending_invitation(locked_keys, *, utc_expiry=False):
+    check_authorization_directories()
     with tempfile.TemporaryDirectory() as temp:
         key = Path(temp) / "invite"
         subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "", "-f", str(key)],

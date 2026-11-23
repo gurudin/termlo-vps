@@ -398,6 +398,14 @@ termlo_doctor() (
     doctor_account_file '安装锁文件' "$config/install.lock" lock
     doctor_account_file 'SSH 配对锁文件' "$HOME/.ssh/.termlo-pair.lock" lock
     doctor_account_file 'SSH 授权文件' "$HOME/.ssh/authorized_keys" keys
+    if [ -n "$py" ] && [ -n "$payload" ]; then
+        if reason=$("$py" -IB -c 'import sys; sys.path.insert(0, sys.argv[1])
+from pairing import check_authorization_directories
+try: check_authorization_directories()
+except (OSError, ValueError) as error: sys.exit(str(error))' "$payload" 2>&1); then
+            doctor_pass 'SSH 授权目录权限  可保存配对公钥'
+        else doctor_block 'SSH 授权目录权限  无法安全保存配对公钥' "$reason"; fi
+    fi
     connection_ok=1
     for record in connection.json installed-components.json; do
         if [ ! -e "$config/$record" ] && [ ! -L "$config/$record" ]; then continue; fi

@@ -41,12 +41,17 @@ def config_dir():
 
 def ssh_endpoint():
     fields = os.environ.get("SSH_CONNECTION", "").split()
-    if len(fields) == 4:
-        try:
-            return ipaddress.ip_address(fields[2]), int(fields[3])
-        except ValueError:
-            pass
-    return None, 22
+    if len(fields) != 4:
+        return None, 22, None
+    try:
+        server, port = ipaddress.ip_address(fields[2]), int(fields[3])
+    except ValueError:
+        return None, 22, None
+    try:
+        client = ipaddress.ip_address(fields[0])
+    except ValueError:
+        client = None
+    return server, port, client
 
 
 def helper_source(*files):
@@ -140,7 +145,7 @@ def saved_connection(path):
 
 def connection_settings(args, terminal=None, region="global", egress=None, *, prompt_later=False, detected_port=None):
     saved = saved_connection(config_dir() / "connection.json")
-    address, internal_port = ssh_endpoint()
+    address, internal_port, client = ssh_endpoint()
     try:
         user = pwd.getpwuid(os.getuid()).pw_name
     except KeyError as error:
@@ -152,7 +157,7 @@ def connection_settings(args, terminal=None, region="global", egress=None, *, pr
     if terminal is not None:
         note(f"\n1/3  确认 SSH 连接\n登录用户  {user}    按回车接受方括号中的默认值。")
         if host is None:
-            host, source = wizard.suggest_host(address, region, egress)
+            host, source = wizard.suggest_host(address, region, egress, client=client)
         else:
             source = "指定地址" if args.host is not None else "上次使用的地址"
         host = wizard.ask_field(terminal, f"服务器地址（{source}）", host, wizard.ssh_host)
@@ -282,7 +287,9 @@ def ensure_claude(packages):
                         "-o", str(script), "https://claude.ai/install.sh"]
             packages.with_https_repair(lambda: subprocess.run(download, check=True))
             with packages.receipt.observe_claude():
-                subprocess.run(["bash", str(script), "stable"], stdout=sys.stderr, check=True)
+                # Only the Termlo wizard reads the controlling terminal. The
+                # official noninteractive installer expects pipe input on macOS.
+                subprocess.run(["bash", str(script), "stable"], input=b"", stdout=sys.stderr, check=True)
     subprocess.run(["claude", "--version"], stdin=subprocess.DEVNULL, stdout=sys.stderr, check=True, timeout=10)
 
 
