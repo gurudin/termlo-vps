@@ -4,17 +4,28 @@
 
 ## 安装和连接
 
-在远程设备的控制台或交互式 SSH 终端执行：
+把安装脚本保存到远程设备，在脚本所在目录运行下面这条命令。[下载 install.sh](https://raw.githubusercontent.com/gurudin/termlo-vps/main/install.sh)
 
 ```sh
-(f=$(mktemp) && trap 'rm -f "$f"' EXIT && curl -fsSL --retry 2 -o "$f" https://raw.githubusercontent.com/gurudin/termlo-vps/main/install.sh && test -s "$f" && sh "$f")
+sh install.sh
 ```
 
-也可以将仓库根目录的 `install.sh` 复制到远端，运行 `sh install.sh`。这两种方式使用同一份完整安装器。
+首次安装和以后重装都会重新体检并显示清单。可用的组件直接复用，缺少的组件自动准备。发现需要手动处理的项目时，会在安装前停下并显示处理方法。只查看清单可运行 `sh install.sh --check`。
 
-只有 BusyBox 和 wget 的 Alpine 可使用同一地址执行 `(f=$(mktemp) && trap 'rm -f "$f"' EXIT && wget -O "$f" https://raw.githubusercontent.com/gurudin/termlo-vps/main/install.sh && test -s "$f" && sh "$f")`。安装器会通过 APK 准备 Bash。
+在全新服务器的 SSH 终端，可以先用下面的命令取得这个文件，再运行上面的安装命令。只有 wget 的设备可将 `curl -fLO` 换成 `wget`。
 
-安装器先显示环境体检清单。已有组件会跳过，可自动补齐的项目列出安装命令。需要人工处理的项目会在安装前阻止继续。只查看清单可运行 `sh install.sh --check`，已安装的设备也可运行 `~/.local/bin/termlo install --check`。
+```sh
+curl -fLO https://raw.githubusercontent.com/gurudin/termlo-vps/main/install.sh
+```
+
+<details>
+<summary>从空服务器的终端一行下载安装</summary>
+
+```sh
+setup=$(curl -fsSL https://raw.githubusercontent.com/gurudin/termlo-vps/main/install.sh) && sh -c "${setup:?安装脚本为空}"
+```
+
+</details>
 
 1. **确认 SSH 地址和端口。** 检查向导给出的建议值。使用 NAT 或端口映射时，填写你的 Mac 实际能访问的地址和对外端口。安装器核对本机 SSH 端口提供的公钥，新设备会自动安装 SSH 服务并生成缺少的主机密钥。已有服务保留原有身份。
 2. **准备开发环境。** 向导复用已有软件，安装缺项并检查各项工具。它会运行同步代理确认版本，启动原生浏览器、渲染一张本地测试页，然后关闭测试实例。只有 Claude Code 可以选装或跳过。必需项出错时会停止，处理后可以用同一条命令重试。
@@ -24,13 +35,13 @@
 
 ## 一键卸载
 
-在远程设备上，用当初安装 Termlo 的 SSH 账号运行以下命令。新版和旧版都可以使用这个入口。
+用当初安装 Termlo 的 SSH 账号，在同一个脚本所在目录运行下面的命令。
 
 ```sh
-(f=$(mktemp) && trap 'rm -f "$f"' EXIT && curl -fsSL --retry 2 -o "$f" https://raw.githubusercontent.com/gurudin/termlo-vps/main/install.sh && test -s "$f" && sh "$f" uninstall)
+sh install.sh uninstall
 ```
 
-新版也可以直接在远端运行 `~/.local/bin/termlo uninstall`，无需下载安装脚本。
+这个脚本也可卸载旧版本。新版已经安装的设备还可直接运行 `~/.local/bin/termlo uninstall`。
 
 卸载会撤销该账号的 Termlo 连接码和已配对 Mac 的 SSH 授权，清理 Termlo 命令与连接配置。新版安装器还会记录实际新增的 Git、tmux、ADB、浏览器、Mutagen 代理及选装的 Claude Code，卸载时按记录移除。若其他项目也在使用这些工具，可在命令末尾加 `--keep-tools`。移除系统软件包时可能需要 sudo。
 

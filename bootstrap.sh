@@ -17,15 +17,14 @@ case ${1:-} in
         interpreter=$(find_python) || { echo '卸载需要 Python 3.8 或更高版本。请运行 sh install.sh --check 查看本机的 Python 安装命令。' >&2; exit 1; }
         exec "$interpreter" -B "$source_dir/termlo.py" uninstall "$@" ;;
 esac
+termlo_doctor "$source_dir" "$(cat "$source_dir/mutagen-releases.txt")" /etc/os-release "$@"
+for arg do [ "$arg" != --check ] || exit 0; done
 if [ "$#" = 0 ]; then
     if ! ( : </dev/tty ) 2>/dev/null; then
         echo '安装向导需要交互终端。请在设备控制台或交互式 SSH 会话中运行。' >&2; exit 1
     fi
     exec </dev/tty
 fi
-
-termlo_doctor "$source_dir" "$(cat "$source_dir/mutagen-releases.txt")" /etc/os-release "$@"
-for arg do [ "$arg" != --check ] || exit 0; done
 family=brew
 [ "$system" = Darwin ] || family=$(linux_manager) || family=unknown
 if [ "$family" = apt ] && ! apt_ready; then restore_apt; fi

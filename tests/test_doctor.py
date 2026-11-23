@@ -74,19 +74,37 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(checked.returncode, 0, checked.stderr)
         self.assertIn("已渲染测试页  " + str(good), checked.stderr)
 
-    def test_copyable_commands_propagate_download_failure_without_running_partial_content(self):
-        commands = re.findall(r"^\(f=.+?\)$", (ROOT / "README.md").read_text(), re.M)
-        self.assertEqual(len(commands), 2)
+    def test_one_line_download_never_executes_an_empty_or_failed_transfer(self):
+        readme = (ROOT / "README.md").read_text()
+        invocation = re.search(r"^setup=.+$", readme, re.M).group()
         for code in (0, 37):
-            for invocation in commands:
-                with self.subTest(code=code, invocation=invocation):
-                    # curl may leave a partial executable body on disk on transfer failure.
-                    command(self.home / "bin/curl", 'while [ "$1" != -o ]; do shift; done\n'
-                            + ('echo "touch $HOME/partial-ran" > "$2"\n' if code else ': > "$2"\n')
-                            + f"exit {code}")
-                    run = subprocess.run(["/bin/sh", "-c", invocation], env=self.env)
-                    self.assertNotEqual(run.returncode, 0)
-                    self.assertFalse((self.home / "partial-ran").exists())
+            with self.subTest(code=code):
+                command(self.home / "bin/curl", ("printf '%s\\n' 'touch \"$HOME/partial-ran\"'\n" if code else "")
+                        + f"exit {code}")
+                run = subprocess.run(["/bin/sh", "-c", invocation], env=self.env, capture_output=True)
+                self.assertNotEqual(run.returncode, 0)
+                self.assertFalse((self.home / "partial-ran").exists())
+        local = invocation.replace("https://raw.githubusercontent.com/gurudin/termlo-vps/main/install.sh",
+                                   self.bundle.as_uri())
+        command(self.home / "bin/curl", 'exec "$REAL_CURL" "$@"')
+        outcome = subprocess.run(["/bin/sh", "-c", local + " termlo --check --sync-only"], env=self.env,
+                                 capture_output=True, text=True)
+        self.assertEqual(outcome.returncode, 0, outcome.stderr)
+        self.assertIn("体检通过", outcome.stderr)
+
+    def test_normal_reinstall_rechecks_the_current_environment_before_changing_any_binding(self):
+        first = self.run_installer("--sync-only")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn("安装前体检", first.stderr)
+        authorized = self.home / ".ssh/authorized_keys"
+        before = authorized.read_bytes()
+        command(self.home / "bin/ssh-keyscan", "exit 1")
+        second = self.run_installer("--sync-only")
+        self.assertNotEqual(second.returncode, 0)
+        self.assertIn("体检未通过", second.stderr)
+        self.assertEqual(authorized.read_bytes(), before)
+        self.assertEqual(second.stdout, "")
+
 
 
 # unittest discovery also sees TestCase classes imported into this module.

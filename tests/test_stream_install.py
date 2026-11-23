@@ -114,6 +114,7 @@ esac
         self.assertEqual(status, 0, transcript)
         self.assertIn("下载线路：" + channel, transcript)
         self.assertFalse((self.home / "bad-url").exists())
+        self.assertLess(transcript.index("安装前体检"), transcript.index("1/3"))
         self.assertIn("3/3", transcript)
         codes = [line for line in transcript.splitlines() if line.startswith("termlo://connect/")]
         self.assertEqual(len(codes), 1, transcript)
