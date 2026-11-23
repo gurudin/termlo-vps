@@ -3,7 +3,7 @@
 import http.client
 import ipaddress
 import json
-import shutil
+import re
 import subprocess
 import sys
 import urllib.request
@@ -16,22 +16,50 @@ def usable_address(address):
                 or address.is_link_local or address.is_reserved)
 
 
-def local_addresses():
-    if not shutil.which("hostname"):
-        return []
+def network_output(command):
     try:
-        result = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=2)
+        result = subprocess.run(command, capture_output=True, text=True, errors="replace", timeout=2)
     except (OSError, subprocess.TimeoutExpired):
-        return []
-    if result.returncode:
-        return []
+        return ""
+    return result.stdout if result.returncode == 0 else ""
+
+
+def mac_address_fields():
+    # scutil orders the primary networks. ifconfig reports which addresses
+    # are currently assigned, usable and temporary.
+    state = network_output(["/usr/sbin/scutil", "--nwi"])
+    primary = re.findall(r"^[ \t]*address[ \t]*:[ \t]*(\S+)", state, re.M)
+    interfaces = network_output(["/sbin/ifconfig", "-au"])
+    if not interfaces:
+        return primary
+
+    priority = {field.split("%", 1)[0]: rank for rank, field in enumerate(primary)}
+    unusable_flags = {"tentative", "duplicated", "detached", "deprecated"}
+    candidates = []
+    for interface in re.split(r"\n(?=\S)", interfaces):
+        if "LOOPBACK" in interface.partition("\n")[0] or "status: inactive" in interface:
+            continue
+        for line in interface.splitlines():
+            parts = line.split()
+            if len(parts) < 2 or parts[0] not in ("inet", "inet6"):
+                continue
+            if unusable_flags.intersection(parts[2:]):
+                continue
+            field = parts[1].split("%", 1)[0]
+            candidates.append((field, "temporary" in parts[2:]))
+    candidates.sort(key=lambda item: (item[1], priority.get(item[0], len(primary))))
+    return [field for field, _ in candidates]
+
+
+def local_addresses():
+    fields = mac_address_fields() if sys.platform == "darwin" else network_output(["hostname", "-I"]).split()
     addresses = []
-    for field in result.stdout.split():
+    for field in fields:
         try:
-            address = ipaddress.ip_address(field)
+            address = ipaddress.ip_address(field.split("%", 1)[0])
         except ValueError:
             continue
-        if usable_address(address):
+        if usable_address(address) and address not in addresses:
             addresses.append(address)
     return addresses
 
@@ -56,6 +84,8 @@ def suggest_host(ssh_address, region="global", egress=None):
     if ssh_address and usable_address(ssh_address) and (ssh_address.is_global or sys.platform == "darwin"):
         return str(ssh_address), "当前 SSH 会话"
     addresses = local_addresses()
+    if sys.platform == "darwin" and addresses:
+        return str(addresses[0]), "本机网络地址，跨网连接请核对"
     for address in addresses:
         if address.is_global:
             return str(address), "本机公网地址"

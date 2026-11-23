@@ -1,6 +1,6 @@
 import argparse
 import base64
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
 import os
@@ -357,6 +357,61 @@ SH''')
 
 
 class HostDetectionTests(unittest.TestCase):
+    def test_mac_console_prefers_its_network_address_over_the_router_exit(self):
+        state = "IPv4 network interface information\n   en1 : flags : 0x5\n         address : 192.168.31.8\n"
+        interfaces = ("en0: flags=8843<UP,RUNNING>\n\tinet 10.8.0.3 netmask 0xffffff00\n"
+                      "en1: flags=8843<UP,RUNNING>\n\tinet 192.168.31.8 netmask 0xffffff00\n")
+        replies = {("/usr/sbin/scutil", "--nwi"): state, ("/sbin/ifconfig", "-au"): interfaces}
+        def network_command(args, **kwargs):
+            data = replies.get(tuple(args), "")
+            return subprocess.CompletedProcess(args, 0 if data else 1, stdout=data, stderr="")
+        with patch.object(sys, "platform", "darwin"), patch.object(subprocess, "run", side_effect=network_command), \
+             patch.object(wizard, "public_egress_address", side_effect=AssertionError("unexpected public lookup")):
+            for egress in ("8.8.8.8", None):
+                self.assertEqual(wizard.suggest_host(None, egress=egress)[0], "192.168.31.8")
+
+    def test_mac_console_uses_an_active_ipv6_interface_without_network_state(self):
+        interfaces = ("lo0: flags=8049<UP,LOOPBACK>\n\tinet 10.9.0.7 netmask 0xff000000\n"
+                      "en0: flags=8843<UP,RUNNING>\n\tinet 192.168.9.9 netmask 0xffffff00\n\tstatus: inactive\n"
+                      "en1: flags=8843<UP,RUNNING>\n\tinet6 fe80::1%en1 prefixlen 64\n"
+                      "\tinet6 fd12::2 prefixlen 64 tentative\n\tinet6 fd12::3 prefixlen 64 temporary\n"
+                      "\tinet6 fd12::8 prefixlen 64\n\tstatus: active\n")
+        def network_command(args, **kwargs):
+            data = interfaces if args == ["/sbin/ifconfig", "-au"] else ""
+            return subprocess.CompletedProcess(args, 0 if data else 1, stdout=data, stderr="")
+        with patch.object(sys, "platform", "darwin"), patch.object(subprocess, "run", side_effect=network_command), \
+             patch.object(wizard, "public_egress_address", side_effect=AssertionError("unexpected public lookup")):
+            self.assertEqual(wizard.suggest_host(None)[0], "fd12::8")
+
+    def test_mac_network_state_cannot_promote_a_temporary_or_unusable_address(self):
+        state = "IPv6 network interface information\n   en0 : flags : 0x5\n         address : fd12::14\n"
+        for flag in ("temporary", "tentative", "duplicated", "detached", "deprecated"):
+            interfaces = ("en0: flags=8843<UP,RUNNING>\n"
+                          f"\tinet6 fd12::14 prefixlen 64 {flag}\n"
+                          "\tinet6 fd12::8 prefixlen 64 secured\n\tstatus: active\n")
+            with self.subTest(flag=flag), patch.object(sys, "platform", "darwin"), \
+                 patch.object(wizard, "network_output", side_effect=[state, interfaces]):
+                self.assertEqual(wizard.suggest_host(None)[0], "fd12::8")
+
+    @unittest.skipUnless(sys.platform == "darwin", "Checks a real macOS console")
+    def test_mac_console_accepts_a_default_assigned_to_this_host(self):
+        output = subprocess.check_output(["/sbin/ifconfig", "-au"], text=True)
+        assigned = set()
+        for line in output.splitlines():
+            fields = line.split()
+            if len(fields) >= 2 and fields[0] in ("inet", "inet6"):
+                address = termlo.ipaddress.ip_address(fields[1].split("%", 1)[0])
+                if wizard.usable_address(address):
+                    assigned.add(address)
+        if not assigned:
+            self.skipTest("No assigned unicast network address on this Mac")
+        args = argparse.Namespace(host=None, port=None, name=None, host_key=None)
+        with tempfile.TemporaryDirectory() as home, patch.dict(os.environ, HOME=home, XDG_CONFIG_HOME=home, SSH_CONNECTION=""), \
+             redirect_stderr(io.StringIO()), patch.object(wizard, "public_egress_address", side_effect=AssertionError):
+            settings = termlo.connection_settings(args, io.StringIO("\n\n"), egress="8.8.8.8", detected_port=2222)
+        self.assertTrue(termlo.ipaddress.ip_address(settings["host"]) in assigned, "Suggested address is not assigned to this Mac")
+        self.assertEqual(settings["port"], 2222)
+
     def test_private_ssh_suggests_egress_or_local_address_when_offline(self):
         private = termlo.ipaddress.ip_address("10.1.2.3")
         with patch.object(sys, "platform", "linux"), patch.object(wizard, "local_addresses", return_value=[]), \

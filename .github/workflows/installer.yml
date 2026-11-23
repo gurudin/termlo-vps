@@ -40,6 +40,9 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
+      - name: Accept the default address on a Mac console with no saved server
+        if: runner.os == 'macOS'
+        run: PYTHONPATH=tests python3 -B -m unittest -v test_vps.HostDetectionTests
       - name: Reuse working tools and render a page with the native browser
         env:
           TERMLO_INSTALL_NETWORK: global
