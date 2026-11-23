@@ -121,29 +121,37 @@ with patch.object(shutil, "which", side_effect=lambda name: None if name == "run
 PY
 
 ssh-keygen -q -t ed25519 -N '' -f device
+# The user's shell may use a different time zone from the running SSH service.
+TZ=EST5 "$HOME/.local/bin/termlo" connection-code > reissued-code
 python3 - <<'PY'
 import base64, json
 from pathlib import Path
-raw = Path("code").read_text().strip().split("/")[-1]
-server = json.loads(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)))
-assert server["host"] == "127.0.0.1" and server["port"] == 22
-Path("invite").write_text(server["pairing"]["key"])
-Path("known_hosts").write_text("127.0.0.1 " + server["hostKey"] + "\n")
+for prefix in ("", "reissued-"):
+    raw = Path(prefix + "code").read_text().strip().split("/")[-1]
+    server = json.loads(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)))
+    assert server["host"] == "127.0.0.1" and server["port"] == 22
+    Path(prefix + "invite").write_text(server["pairing"]["key"])
+    if not prefix:
+        Path("known_hosts").write_text("127.0.0.1 " + server["hostKey"] + "\n")
 PY
 mkdir -p "$HOME/.ssh"
 cat > "$HOME/.ssh/config" <<EOF
 Host termlo-test
+  IdentityFile "$work/device"
+Host termlo-test termlo-bind
   HostName 127.0.0.1
   Port 22
   User root
-  IdentityFile "$work/device"
   IdentitiesOnly yes
+  IdentityAgent none
   BatchMode yes
   UserKnownHostsFile "$work/known_hosts"
   StrictHostKeyChecking yes
 EOF
 key=$(awk '{print $2}' device.pub)
-ssh -i "$work/invite" termlo-test "termlo-pair $key" | grep -qx termlo-paired-v2
+for invite in invite reissued-invite; do
+    ssh -i "$work/$invite" termlo-bind "termlo-pair $key" | grep -qx termlo-paired-v2
+done
 test "$(ssh termlo-test 'printf paired')" = paired
 
 mkdir mac-project vps-project

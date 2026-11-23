@@ -180,6 +180,36 @@ fcntl.flock = trace_lock
         pin = subprocess.check_output(["ssh-keygen", "-lf", str(offered) + ".pub"], text=True).split()[1]
         self.assertEqual(self.decode(code)["fingerprint"], pin)
 
+    def test_first_and_reissued_invitations_match_the_ssh_deadline_across_time_zones(self):
+        command(self.bin / "ssh-keyscan", '''
+banner="# dev.example.org:22 SSH-2.0-$PEER"
+if [ "$STREAM" = stdout ]; then echo "$banner"; else echo "$banner" >&2; fi
+printf "host "; cat "$HOME/ssh host key.pub"''')
+        keys = self.home / ".ssh/authorized_keys"
+        keys.parent.mkdir()
+        existing = b"# Existing SSH configuration\n"
+        keys.write_bytes(existing)
+        cases = [("OpenSSH_9.1p1", "stderr", True), ("OpenSSH_10.2", "stdout", True),
+                 ("OpenSSH_8.9p1", "stdout", False), ("unidentified", "stderr", False)]
+        for index, (peer, stream, utc) in enumerate(cases):
+            with self.subTest(peer=peer), patch.dict(os.environ, PEER=peer, STREAM=stream, TZ="EST5"):
+                code = self.install() if index == 0 else subprocess.check_output(
+                    [str(self.cli), "connection-code"], text=True)
+                body = code.strip().split("/")[-1]
+                invite = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))["pairing"]
+                deadline = keys.read_text().splitlines()[-1].split('expiry-time="')[1].split('"')[0]
+                self.assertEqual(deadline.endswith("Z"), utc)
+                # Interpret the authorized_keys text as the service would, outside the issuing shell.
+                system_env = dict(os.environ)
+                del system_env["TZ"]
+                parsed = subprocess.check_output([sys.executable, "-IS", "-c",
+                    "import datetime as d,sys; s=sys.argv[1]; t=d.datetime.strptime(s[:14],'%Y%m%d%H%M%S'); "
+                    "print(int((t.replace(tzinfo=d.timezone.utc) if s.endswith('Z') else t).timestamp()))",
+                    deadline], env=system_env, text=True)
+                self.assertEqual(int(parsed), invite["expiresAt"])
+        subprocess.run([str(self.cli), "uninstall", "--keep-tools"], check=True, capture_output=True)
+        self.assertEqual(keys.read_bytes(), existing)
+
     def test_port_discovered_after_first_sshd_start_is_used_unless_user_sets_public_port(self):
         (self.bin / "awk").symlink_to("/usr/bin/awk")
         command(self.bin / "sshd", 'echo "port 2248"')

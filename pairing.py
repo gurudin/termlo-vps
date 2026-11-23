@@ -9,6 +9,7 @@ import re
 import secrets
 import shlex
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -84,7 +85,7 @@ def managed_key(line):
     entry = invitation_entry(line)
     if entry:
         command = binding_command(entry[2].decode()).encode()
-        match = re.fullmatch(rb'restrict,expiry-time="[0-9]{14}",command="' + re.escape(command)
+        match = re.fullmatch(rb'restrict,expiry-time="[0-9]{14}Z?",command="' + re.escape(command)
                              + rb'" ssh-ed25519 ([A-Za-z0-9+/]{68})', line[:entry.start()])
     else:
         match = re.fullmatch(rb"ssh-ed25519 ([A-Za-z0-9+/]{68}) termlo-mac", line)
@@ -108,8 +109,23 @@ def revoke_all():
     return count
 
 
+def ssh_expiry_time(expires, utc_expiry):
+    if utc_expiry:
+        return time.strftime("%Y%m%d%H%M%SZ", time.gmtime(expires))
+    # Older sshd interprets a 14-digit deadline in the system time zone.
+    # Keep the caller's TZ intact, including when other threads use it.
+    if "TZ" in os.environ:
+        system_env = os.environ.copy()
+        del system_env["TZ"]
+        return subprocess.check_output(
+            [sys.executable, "-IS", "-c",
+             "import sys,time; print(time.strftime('%Y%m%d%H%M%S', time.localtime(int(sys.argv[1]))))",
+             str(expires)], text=True, env=system_env).strip()
+    return time.strftime("%Y%m%d%H%M%S", time.localtime(expires))
+
+
 @contextmanager
-def pending_invitation(locked_keys):
+def pending_invitation(locked_keys, *, utc_expiry=False):
     with tempfile.TemporaryDirectory() as temp:
         key = Path(temp) / "invite"
         subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "", "-f", str(key)],
@@ -121,7 +137,7 @@ def pending_invitation(locked_keys):
     path, lines = locked_keys
     now = int(time.time())
     expires = now + LIFETIME
-    deadline = time.strftime("%Y%m%d%H%M%S", time.localtime(expires))
+    deadline = ssh_expiry_time(expires, utc_expiry)
     options = f'restrict,expiry-time="{deadline}",command="{command}"'
     marker = f"termlo-pair:{ticket}:{expires}"
     live = [line for line in lines if not ((match := invitation_entry(line))

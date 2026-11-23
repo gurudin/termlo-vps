@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import pkgutil
 import pwd
+import re
 import shlex
 import shutil
 import ssl
@@ -59,10 +60,17 @@ def shell_helper(function, *args, check=True, stdout=None):
 
 def verified_identity(settings, packages=None, *, require_key=False):
     def scan():
-        probe = shell_helper("scan_ssh", str(settings["local_port"]), check=False, stdout=subprocess.PIPE)
-        return [line.split() for line in probe.stdout.decode("ascii").splitlines()] if probe.returncode == 0 else []
+        with tempfile.NamedTemporaryFile() as log:
+            probe = shell_helper("scan_ssh", str(settings["local_port"]), log.name, check=False, stdout=subprocess.PIPE)
+            if probe.returncode:
+                return [], False
+            # OpenSSH 9.1 added UTC deadlines in authorized_keys. Use the
+            # listener's banner since the installed client may be a different version.
+            version = re.search(rb"^# \S+ SSH-2\.0-OpenSSH_(\d{1,3})\.(\d{1,3})(?=p|[-\s]|$)", log.read(), re.M)
+        utc_expiry = bool(version and tuple(map(int, version.groups())) >= (9, 1))
+        return [line.split() for line in probe.stdout.decode("ascii").splitlines()], utc_expiry
 
-    keys = scan()
+    keys, utc_expiry = scan()
     if not keys and packages is not None:
         if os.environ.get("SSH_CONNECTION"):
             raise ValueError("当前 SSH 会话的本机端口未返回主机公钥。请用 ssh-keyscan -p 端口 本机监听地址 检查 sshd。")
@@ -72,7 +80,7 @@ def verified_identity(settings, packages=None, *, require_key=False):
         repair = shell_helper("prepare_sshd", check=False, stdout=sys.stderr)
         if repair.returncode == 0:
             for attempt in range(8):
-                keys = scan()
+                keys, utc_expiry = scan()
                 if keys:
                     break
                 time.sleep(0.4)
@@ -102,8 +110,9 @@ def verified_identity(settings, packages=None, *, require_key=False):
     settings["local_port"] = accepted[preferred]
     if settings["port"] is None:
         settings["port"] = settings["local_port"]
-    return connection_details(settings["host"], settings["port"], settings["user"], name=settings["name"],
-                              public_key=preferred, include_host_key=True)
+    details = connection_details(settings["host"], settings["port"], settings["user"], name=settings["name"],
+                                 public_key=preferred, include_host_key=True)
+    return details, utc_expiry
 
 
 def saved_connection(path):
@@ -396,7 +405,7 @@ def install_cli():
             stage.unlink()
 
 
-def publish_connection(folder, settings, details):
+def publish_connection(folder, settings, details, utc_expiry):
     target = folder / "connection.json"
     with tempfile.TemporaryDirectory(dir=folder) as temporary:
         previous = Path(temporary) / "previous"
@@ -404,7 +413,7 @@ def publish_connection(folder, settings, details):
             shutil.copy2(target, previous, follow_symlinks=False)
         with tempfile.NamedTemporaryFile(dir=temporary, mode="w", encoding="utf-8", delete=False) as staged:
             json.dump(settings, staged, ensure_ascii=False)
-        with pairing.locked_authorized_keys() as keys, pairing.pending_invitation(keys) as invitation:
+        with pairing.locked_authorized_keys() as keys, pairing.pending_invitation(keys, utc_expiry=utc_expiry) as invitation:
             code = encode(dict(details, version=2, pairing=invitation))
             os.replace(staged.name, target)
             try:
@@ -484,7 +493,7 @@ def install_in_directory(args, terminal, checked, interactive, state):
                 raise ValueError("安装 OpenSSH 后仍找不到 " + "、".join(missing) + "，请核对当前 SSH 账号的 PATH 和软件包。")
         if sys.platform == "linux" and packages.family == "apt":
             shell_helper("restore_apt", stdout=sys.stderr)
-        details = verified_identity(settings, packages, require_key=args.host_key is not None)
+        details, utc_expiry = verified_identity(settings, packages, require_key=args.host_key is not None)
         note("\n2/3  准备远程开发环境")
         if not tool_works(["curl", "--version"]):
             packages.install(["curl"])
@@ -503,7 +512,7 @@ def install_in_directory(args, terminal, checked, interactive, state):
                     ensure_claude(packages)
                 except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
                     optional_failure = error
-        code = publish_connection(folder, settings, details)
+        code = publish_connection(folder, settings, details, utc_expiry)
     if terminal is not None:
         note("\n3/3  复制连接码")
     note("在这台远程设备上卸载可运行 ~/.local/bin/termlo uninstall")
@@ -581,8 +590,8 @@ def dispatch(args, preflight_dir=None):
     elif args.command == "connection-code":
         add_tool_paths()
         with pairing.locked_authorized_keys() as keys:
-            details = verified_identity(connection_settings(args), require_key=args.host_key is not None)
-            with pairing.pending_invitation(keys) as invitation:
+            details, utc_expiry = verified_identity(connection_settings(args), require_key=args.host_key is not None)
+            with pairing.pending_invitation(keys, utc_expiry=utc_expiry) as invitation:
                 code = encode(dict(details, version=2, pairing=invitation))
         print(code)
     elif args.command == "redeem":

@@ -83,3 +83,23 @@ class PairingTests(unittest.TestCase):
         lines = self.keys.read_bytes().splitlines(keepends=True)
         self.assertIn(custom, lines)
         self.assertNotIn(issued, lines)
+
+    def test_expired_utc_and_legacy_entries_are_removed_together(self):
+        legacy, old_ticket = self.issue()
+        with pairing.locked_authorized_keys() as keys, pairing.pending_invitation(keys, utc_expiry=True) as modern:
+            expiry = max(legacy["expiresAt"], modern["expiresAt"])
+        current = self.keys.read_bytes().splitlines(keepends=True)[-1]
+        modern_ticket = pairing.invitation_entry(current)[2].decode()
+        self.assertIn(b'Z",command=', current)
+        other = current.replace(b" redeem ", b" unrelated ")
+        with self.keys.open("ab") as stream:
+            stream.write(other)
+        with patch.object(pairing.time, "time", return_value=expiry):
+            for ticket in (old_ticket, modern_ticket):
+                with self.assertRaisesRegex(ValueError, "过期"):
+                    pairing.redeem(ticket, self.request())
+            pairing.issue()
+        lines = self.keys.read_bytes().splitlines(keepends=True)
+        self.assertNotIn(current, lines)
+        self.assertNotIn(old_ticket.encode(), b"".join(lines))
+        self.assertIn(other, lines)

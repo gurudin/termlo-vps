@@ -177,9 +177,16 @@ ENDPOINT
         case $port in ''|*[!0-9]*) continue ;; esac
         for address in $addresses; do
             case $address in -*|*[!a-zA-Z0-9:.%_-]*) continue ;; esac
-            result=$(ssh-keyscan -T 3 -p "$port" -t ed25519,ecdsa,rsa "$address" 2>/dev/null) || continue
+            # The optional private file receives diagnostics for this endpoint only.
+            # Only stdout supplies host keys.
+            result=$(ssh-keyscan -T 3 -p "$port" -t ed25519,ecdsa,rsa "$address" 2>"${2:-/dev/null}") || continue
             found=0
             while read -r server kind data comment; do
+                # Some ssh-keyscan releases emit the peer banner as a stdout comment.
+                if [ "$server" = '#' ]; then
+                    if [ -n "${2:-}" ]; then printf '# %s %s\n' "$kind" "$data" >> "$2"; fi
+                    continue
+                fi
                 case $kind in ssh-ed25519|ecdsa-sha2-*|ssh-rsa)
                     [ -n "$data" ] || continue
                     if has ssh-keygen; then
@@ -254,7 +261,9 @@ DIAGNOSTICS
     return 1
 )
 
-prepare_sshd() {
+prepare_sshd() (
+    # A daemon started directly by this installer should use the system time zone.
+    unset TZ
     # -A generates missing host identities and preserves all existing private keys.
     as_root ssh-keygen -A || return 1
     if [ "$(uname -s)" = Darwin ]; then
@@ -270,7 +279,7 @@ prepare_sshd() {
             as_root "$(command -v sshd)"
         fi
     fi
-}
+)
 
 restore_apt() {
     apt_ready && return 0
