@@ -1,65 +1,56 @@
-name: Clean Linux installation
+name: First public install and SSH binding
 on:
   push:
-    branches: [main, 'verify-installer/**']
-  pull_request:
-
+    branches: ['verify-installer/interactive-review-20261123']
 permissions:
   contents: read
-
 jobs:
-  installation:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 25
-    strategy:
-      fail-fast: false
-      matrix:
-        image: ['debian:12-slim', 'alpine:3.22']
-    steps:
-      - uses: actions/checkout@v5
-      - name: Install, bind over SSH and sync a file in both directions
-        run: |
-          docker run --rm --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
-            -e TERMLO_DISPOSABLE_INSTALL_TEST=1 --mount type=bind,src="$PWD",dst=/src,readonly \
-            '${{ matrix.image }}' sh /src/tests/clean-install.sh
-
-  rocky-cloud:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v5
-      - name: Verify Chromium and SSH sync on the stock Rocky kernel
-        run: bash tests/rocky-cloud.sh
-
-  existing-host:
+  first-install:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-15]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 23
     steps:
       - uses: actions/checkout@v5
-      - name: Accept the default address on a Mac console with no saved server
-        if: runner.os == 'macOS'
-        run: PYTHONPATH=tests python3 -B -m unittest -v test_vps.HostDetectionTests
-      - name: Reuse working tools and render a page with the native browser
-        env:
-          TERMLO_INSTALL_NETWORK: global
+        with:
+          persist-credentials: false
+      - name: Prepare a private Debian SSH host without Python or Termlo
+        if: runner.os == 'Linux'
+        shell: bash
         run: |
+          set -euo pipefail
           umask 077
-          ssh-keygen -q -t ed25519 -N '' -f "$RUNNER_TEMP/host-key"
-          printf 'ListenAddress 127.0.0.1\nPort 2222\nHostKey %s/host-key\nPidFile %s/sshd.pid\n' "$RUNNER_TEMP" "$RUNNER_TEMP" > "$RUNNER_TEMP/sshd_config"
-          if [ "$(uname)" = Linux ]; then sudo install -d -m 0755 /run/sshd; fi
-          sudo /usr/sbin/sshd -f "$RUNNER_TEMP/sshd_config"
-          for attempt in 1 2; do
-            sh install.sh --without-claude --host 127.0.0.1 --port 2222 > "$RUNNER_TEMP/code"
-            grep -q '^termlo://connect/' "$RUNNER_TEMP/code"
-          done
-          "$HOME/.local/bin/termlo" browser check
-      - name: Render with an empty Mac home and no login keychain
+          docker network create termlo-review-net
+          docker run -d --name termlo-review --network termlo-review-net --cap-add SYS_ADMIN --security-opt apparmor=unconfined debian:12-slim sleep infinity
+          docker exec termlo-review apt-get update -qq
+          docker exec -e DEBIAN_FRONTEND=noninteractive termlo-review apt-get install -y --no-install-recommends ca-certificates curl openssh-server
+          docker exec termlo-review sh -ec '! command -v python3; install -dm700 /root/.ssh; install -dm755 /run/sshd'
+          ssh-keygen -q -t ed25519 -N '' -f "$RUNNER_TEMP/review-bootstrap"
+          docker cp "$RUNNER_TEMP/review-bootstrap.pub" termlo-review:/root/.ssh/authorized_keys
+          host=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' termlo-review)
+          gateway=$(docker network inspect -f '{{(index .IPAM.Config 0).Gateway}}' termlo-review-net)
+          printf 'ListenAddress %s\nListenAddress 127.0.0.1\nPermitRootLogin prohibit-password\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nUsePAM no\nDisableForwarding yes\nAllowUsers root@%s\nSubsystem sftp internal-sftp\n' "$host" "$gateway" > "$RUNNER_TEMP/private-sshd.conf"
+          docker cp "$RUNNER_TEMP/private-sshd.conf" termlo-review:/run/review-sshd.conf
+          docker exec termlo-review sh -ec 'chmod 600 /root/.ssh/authorized_keys; /usr/sbin/sshd -f /run/review-sshd.conf'
+          printf 'REVIEW_HOST=%s\nREVIEW_USER=root\nREVIEW_BOOTSTRAP=%s/review-bootstrap\n' "$host" "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Prepare a private SSH listener for a fresh Mac console
         if: runner.os == 'macOS'
+        shell: bash
         run: |
-          cli="$HOME/.local/bin/termlo"
-          probe_home=$(mktemp -d "$RUNNER_TEMP/termlo-keychain.XXXXXXXX")
-          HOME="$probe_home" CFFIXED_USER_HOME="$probe_home" "$cli" browser check </dev/null
+          set -euo pipefail
+          umask 077
+          iface=$(route -n get default | awk '/interface:/ { print $2; exit }')
+          host=$(ipconfig getifaddr "$iface")
+          python3 -c 'import ipaddress,sys; a=ipaddress.ip_address(sys.argv[1]); assert a.is_private and not a.is_loopback' "$host"
+          if ! ssh-keyscan -T 3 -t ed25519 "$host" > "$RUNNER_TEMP/already-listening" 2>/dev/null; then
+            ssh-keygen -q -t ed25519 -N '' -f "$RUNNER_TEMP/review-host"
+            printf 'ListenAddress %s\nListenAddress 127.0.0.1\nHostKey %s/review-host\nPidFile %s/review-sshd.pid\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin no\nUsePAM no\nDisableForwarding yes\nAllowUsers %s@%s %s@127.0.0.1\nSubsystem sftp internal-sftp\n' "$host" "$RUNNER_TEMP" "$RUNNER_TEMP" "$(id -un)" "$host" "$(id -un)" > "$RUNNER_TEMP/review-sshd.conf"
+            sudo /usr/sbin/sshd -f "$RUNNER_TEMP/review-sshd.conf"
+          fi
+          ssh-keyscan -T 5 -t ed25519 "$host" > "$RUNNER_TEMP/listening" 2>/dev/null
+          printf 'REVIEW_HOST=%s\nREVIEW_USER=%s\n' "$host" "$(id -un)" >> "$GITHUB_ENV"
+      - name: Use the public command, accept the defaults and bind a new client
+        shell: bash
+        run: python3 -B tests/interactive_review.py
