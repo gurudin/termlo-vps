@@ -24,7 +24,7 @@ if [ "$#" = 0 ]; then
     exec </dev/tty
 fi
 
-termlo_doctor "$source_dir" "$(cat "$source_dir/mutagen-releases.txt")" "$@"
+termlo_doctor "$source_dir" "$(cat "$source_dir/mutagen-releases.txt")" /etc/os-release "$@"
 for arg do [ "$arg" != --check ] || exit 0; done
 family=brew
 [ "$system" = Darwin ] || family=$(linux_manager) || family=unknown
@@ -56,6 +56,6 @@ if ! interpreter=$(find_python); then
     fi
     interpreter=$(find_python) || { echo 'Python 未通过运行检查，请按体检列出的 Python 命令修复后重试。' >&2; exit 1; }
     # Repeat the checks that need a working interpreter (browser, checksum and HTTPS).
-    termlo_doctor "$source_dir" "$(cat "$source_dir/mutagen-releases.txt")" "$@"
+    termlo_doctor "$source_dir" "$(cat "$source_dir/mutagen-releases.txt")" /etc/os-release "$@"
 fi
 exec "$interpreter" -B "$source_dir/bootstrap.py" install "$@"

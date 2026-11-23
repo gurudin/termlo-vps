@@ -73,7 +73,7 @@ RELEASES
 )
 
 termlo_doctor() (
-    payload=$1; manifest=$2; shift 2
+    payload=$1; manifest=$2; release=$3; shift 3
     system=$(uname -s); machine=$(uname -m)
     blocked=0; packages_needed=0; admin_needed=0; full=1; check_only=0
     port=22; key=''; claude=选装
@@ -117,7 +117,7 @@ termlo_doctor() (
     if [ -e "$HOME/.ssh/authorized_keys" ] && ! { [ -f "$HOME/.ssh/authorized_keys" ] && [ -r "$HOME/.ssh/authorized_keys" ]; }; then
         doctor_block 'SSH 授权文件无法读取' '请在此账号检查 ls -l "$HOME/.ssh/authorized_keys"'
     fi
-    if [ "$system" = Darwin ]; then family=brew; else family=$(linux_manager "${TERMLO_DOCTOR_OS_RELEASE:-/etc/os-release}") || family=unknown; fi
+    if [ "$system" = Darwin ]; then family=brew; else family=$(linux_manager "$release") || family=unknown; fi
     manager=''
     if [ "$family" = rpm ]; then
         for tool in dnf yum microdnf; do if has "$tool"; then manager=$tool; break; fi; done
@@ -173,10 +173,18 @@ ENDPOINT
         if { [ "$system" != Darwin ] || [ "$(command -v git || :)" != /usr/bin/git ] || /usr/bin/xcode-select -p >/dev/null 2>&1; } && git --version >/dev/null 2>&1; then doctor_row 就绪 Git; else doctor_package Git git git git git; fi
         if tmux -V >/dev/null 2>&1; then doctor_row 就绪 tmux; else doctor_package tmux tmux tmux tmux tmux; fi
         if adb version >/dev/null 2>&1; then doctor_row 就绪 ADB; else doctor_package ADB adb android-tools android-tools '--cask android-platform-tools'; fi
-        if [ -n "$py" ] && browser=$("$py" -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import native_browser; print(native_browser.check())' "$payload" 2>&1); then
+        if [ -z "$py" ]; then
+            doctor_row 待核验 '远程浏览器  Python 就绪后试启动，能渲染测试页就直接复用'
+            if [ "$family" = apt ] && [ -r "$release" ] && ( . "$release"; [ "${ID:-}" = ubuntu ] ); then
+                doctor_hint "缺少时安装 Chromium：${priv}snap install chromium"
+            else doctor_hint "缺少时运行：$(package_hint 'chromium chromium-sandbox' chromium chromium '--cask google-chrome')"; fi
+        elif browser=$("$py" -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import native_browser
+try: print(native_browser.check())
+except (OSError, ValueError) as error: sys.exit(str(error))' "$payload" 2>&1); then
             doctor_row 就绪 "远程浏览器  已渲染测试页  $browser"
         else
-            if [ "$family" = apt ] && [ -r /etc/os-release ] && ( . /etc/os-release; [ "${ID:-}" = ubuntu ] ); then
+            doctor_hint "$browser"
+            if [ "$family" = apt ] && [ -r "$release" ] && ( . "$release"; [ "${ID:-}" = ubuntu ] ); then
                 if [ ! -d /run/systemd/system ] && [ ! -S /run/snapd.socket ] && [ -n "$py" ] &&
                    ! "$py" -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import native_browser; sys.exit(not native_browser.executable())' "$payload"; then
                     doctor_block 'Ubuntu Chromium 需要 Snap 服务或已安装的原生浏览器' '在启用 systemd 的 Ubuntu 上运行 sudo systemctl enable --now snapd.socket，或安装可运行的 Google Chrome 后重试。'
@@ -191,7 +199,7 @@ ENDPOINT
         if claude --version >/dev/null 2>&1; then doctor_row 就绪 'Claude Code'
         else
             doctor_row "$claude" 'Claude Code'
-            doctor_hint '可单独选装：sh install.sh --with-claude --host 服务器地址'
+            doctor_hint '基础环境装好后可运行 ~/.local/bin/termlo install --with-claude'
         fi
     fi
     case $family in
@@ -205,7 +213,14 @@ ENDPOINT
             else doctor_block '缺少发行版软件管理器' "请管理员用同版本官方安装介质恢复软件包，RPM 系统可在含 dnf 及其依赖的目录运行 ${priv}rpm -Uvh --replacepkgs ./*.rpm。"; fi ;;
         brew)
             if has brew; then doctor_row 就绪 Homebrew
-            elif [ "$packages_needed" = 1 ]; then doctor_row 自动安装 Homebrew; doctor_hint '将运行 Homebrew 官方安装程序，需要管理员授权。'; admin_needed=1; fi ;;
+            elif [ "$packages_needed" = 1 ]; then
+                doctor_row 自动安装 Homebrew
+                doctor_hint "安装器会运行官方程序，需要管理员授权。手动运行："
+                cat >&2 <<'BREW_COMMAND'
+           (f=$(mktemp) && trap 'rm -f "$f"' EXIT && curl -fsSL -o "$f" https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh && test -s "$f" && /bin/bash "$f")
+BREW_COMMAND
+                admin_needed=1
+            fi ;;
         *) if [ "$packages_needed" = 1 ]; then doctor_block '无法识别系统包管理器' '请使用 Debian/Ubuntu、RPM 系、Alpine Linux 或 macOS 安装。'; fi ;;
     esac
     if [ "$packages_needed" = 1 ] && [ "$family" != brew ]; then admin_needed=1; fi
@@ -220,5 +235,6 @@ ENDPOINT
         else doctor_block '当前账号无法安装系统组件' '请管理员执行上面列出的命令，或在交互式 SSH 终端运行 sudo -v 后重试。'; fi
     fi
     if [ "$blocked" != 0 ]; then echo '体检未通过。处理以上项目后，重新运行安装命令。' >&2; return 1; fi
-    echo '体检通过。' >&2
+    if [ "$check_only" = 1 ]; then echo '体检通过。正常运行安装命令即可补齐缺项。' >&2
+    else echo '体检通过。已安装且可用的组件会直接复用。' >&2; fi
 )

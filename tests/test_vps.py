@@ -219,6 +219,18 @@ SH''')
         self.assertEqual(defaults, explicit)
         self.assertEqual(self.events.read_text().splitlines(), ["https://claude.ai/install.sh"])
 
+    def test_explicit_optional_download_failure_returns_a_usable_base_connection(self):
+        self.prepare_fake_linux_tools()
+        command(self.bin / "curl", '[ "$1" = --version ] || exit 7')
+        args = argparse.Namespace(host="dev.example.org", port=22, host_key=self.public,
+                                  name=None, sync_only=False, claude=True)
+        output = io.StringIO()
+        with redirect_stdout(output), self.assertRaisesRegex(ValueError, "Claude Code 未完成"):
+            termlo.install(args)
+        self.assertEqual(self.decode(output.getvalue().strip())["host"], "dev.example.org")
+        self.assertTrue(self.cli.exists())
+        self.assertTrue((self.home / ".ssh/authorized_keys").is_file())
+
     def test_wizard_cancel_preserves_saved_config(self):
         self.prepare_fake_linux_tools()
         original = self.install()

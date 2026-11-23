@@ -352,16 +352,16 @@ def install(args, terminal=None, checked=False):
             flags.append("--with-claude" if args.claude else "--without-claude")
         if getattr(args, "check", False):
             flags.append("--check")
-        os_release_env = dict(os.environ, TERMLO_DOCTOR_OS_RELEASE=str(OS_RELEASE))
         check_script = helper_source("python-runtime.sh", "prerequisites.sh", "doctor.sh") + b'\ntermlo_doctor "$@"\n'
         check_result = subprocess.run(["/bin/sh", "-s", "--", str(Path(__file__).parent),
-                                       helper_source("mutagen-releases.txt").decode(), *flags],
-                                      input=check_script, env=os_release_env)
+                                       helper_source("mutagen-releases.txt").decode(), str(OS_RELEASE), *flags],
+                                      input=check_script)
         if check_result.returncode:
             raise ValueError("安装前体检未通过。")
     if getattr(args, "check", False):
         return
     region, egress = install_network()
+    optional_failure = None
     folder = config_dir()
     folder.mkdir(mode=0o700, parents=True, exist_ok=True)
     with (folder / "install.lock").open("a") as lock, tempfile.TemporaryDirectory(prefix="termlo-install-") as state:
@@ -390,7 +390,10 @@ def install(args, terminal=None, checked=False):
             if terminal is not None:
                 select_claude(terminal, packages)
             elif args.claude is True:
-                ensure_claude(packages)
+                try:
+                    ensure_claude(packages)
+                except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+                    optional_failure = error
         install_cli()
         with tempfile.NamedTemporaryFile(dir=folder, mode="w", encoding="utf-8", delete=False) as out:
             json.dump(settings, out, ensure_ascii=False)
@@ -399,9 +402,12 @@ def install(args, terminal=None, checked=False):
     if terminal is not None:
         note("\n3/3  复制连接码")
     note("在这台远程设备上卸载可运行 ~/.local/bin/termlo uninstall")
-    note("安装完成。将下面一整行粘贴到 Mac 的「添加服务器」，点「连接」。")
+    note(("基础环境已就绪，选装的 Claude Code 安装失败。" if optional_failure else "安装完成。")
+         + "将下面一整行粘贴到 Mac 的「添加服务器」，点「连接」。")
     note("连接码在 10 分钟内有效，可绑定一台 Mac。以后在这台 Mac 上点服务器名称即可连接。")
-    print(code)
+    print(code, flush=True)
+    if optional_failure:
+        raise ValueError(f"Claude Code 未完成：{optional_failure}。稍后运行 ~/.local/bin/termlo install --with-claude 重试。")
 
 
 def add_endpoint_options(parser):

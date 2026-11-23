@@ -112,18 +112,32 @@ ENDPOINT
         [ "$requested" = 22 ] || ports="$ports 22"
         addresses='127.0.0.1 ::1'
     fi
+    # A console install may target a daemon bound only to a LAN interface,
+    # or expose a custom internal port through NAT. Never scan the public --host.
+    if [ -z "${SSH_CONNECTION:-}" ]; then
+        if has hostname; then addresses="$addresses $(hostname -I 2>/dev/null || :)"; fi
+        if has ifconfig && has awk; then
+            addresses="$addresses $(ifconfig -a 2>/dev/null | awk '$1=="inet" || $1=="inet6" { print $2 }')"
+        fi
+        if has sshd && has awk; then
+            ports="$ports $("$(command -v sshd)" -T 2>/dev/null | awk '$1=="port" { print $2 }')"
+        fi
+    fi
     for port in $ports; do
         case $port in ''|*[!0-9]*) continue ;; esac
         for address in $addresses; do
+            case $address in -*|*[!a-zA-Z0-9:.%_-]*) continue ;; esac
             result=$(ssh-keyscan -T 3 -p "$port" -t ed25519,ecdsa,rsa "$address" 2>/dev/null) || continue
+            found=0
             while read -r server kind data comment; do
                 case $kind in ssh-ed25519|ecdsa-sha2-*|ssh-rsa)
                     [ -n "$data" ] || continue
-                    printf '%s %s %s\n' "$port" "$kind" "$data";; esac
+                    printf '%s %s %s\n' "$port" "$kind" "$data"
+                    found=1 ;; esac
             done <<KEYS
 $result
 KEYS
-            case $result in *' ssh-'*|*' ecdsa-sha2-'*) return 0 ;; esac
+            [ "$found" = 0 ] || return 0
         done
     done
     return 1

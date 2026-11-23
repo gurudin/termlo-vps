@@ -106,8 +106,7 @@ test "$(cat mac-project/file)" = returned
 ./mutagen sync terminate termlo-test
 
 if [ "$ID" = debian ]; then
-    # Exercise the library fallback when both APT frontends are missing.
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-apt
+    # Recover with both frontends missing, without provisioning Python APT bindings.
     mv /usr/bin/apt "$work/original-apt"
     mv /usr/bin/apt-get "$work/recovered-apt-get"
     mv /usr/bin/tmux "$work/original-tmux"

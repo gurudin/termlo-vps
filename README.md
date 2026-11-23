@@ -67,6 +67,6 @@ adb version
 
 ## 从源码运行
 
-运行 `bash bootstrap.sh` 可从源码打开向导。已有自动化可使用 `--host`、`--port`、`--host-key`，并用 `--without-claude` 或 `--with-claude` 明确选择 Claude Code。`--sync-only` 保留为只准备 SSH 和同步代理的单独入口。
+运行 `bash bootstrap.sh` 可从源码打开向导。已有自动化可使用 `--host`、`--port`、`--host-key`，并用 `--without-claude` 或 `--with-claude` 明确选择 Claude Code。非交互选装 Claude Code 单独失败时，仍输出可用的基础环境连接码，同时返回失败状态并给出重试命令。`--sync-only` 保留为只准备 SSH 和同步代理的单独入口。
 
 更新源码后运行 `bash build-installer.sh`，生成可独立分发的 `install.sh` 和兼容入口 `dist/termlo-install.sh`。运行 `python3 -B -m unittest discover -s tests -v` 检查安装器。

@@ -41,9 +41,7 @@ class DoctorTests(unittest.TestCase):
         tools = self.home / "bin"
         (tools / "python3").unlink()
         (tools / "apt-get").unlink()
-        release = self.home / "debian"
-        release.write_text("ID=debian\n")
-        self.env["TERMLO_DOCTOR_OS_RELEASE"] = str(release)
+        command(tools / "dpkg", '[ "$1" != --print-architecture ] || echo amd64')
         # The fixture provides neither a package manager nor a helper with apt bindings.
         (self.home / ".mutagen/agents/0.18.1/mutagen-agent").unlink()
         self.env["TERMLO_MUTAGEN_ARCHIVE"] = str(self.home / "missing archive")
