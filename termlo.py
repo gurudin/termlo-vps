@@ -110,9 +110,15 @@ def saved_connection(path):
     for field in ("host", "name", "host_key"):
         if saved.get(field) is not None and not isinstance(saved[field], str):
             raise ValueError(f"connection.json 的 {field} 需要是文本")
+    if saved.get("host") is not None:
+        validate_host(saved["host"])
+    if saved.get("name") is not None and not saved["name"].strip():
+        raise ValueError("connection.json 的 name 不能为空，请填写服务器名称或移除这个可选字段")
     for field in ("port", "local_port"):
         if saved.get(field) is not None:
             saved[field] = wizard.ssh_port(str(saved[field]))
+        else:
+            saved.pop(field, None)
     return saved
 
 
@@ -354,10 +360,11 @@ def add_tool_paths():
         os.environ["PATH"] += ":/usr/sbin:/sbin"
 
 
-def install(args, terminal=None, checked=False, interactive=False):
+def install(args, terminal=None, preflight_dir=None, interactive=False):
     add_tool_paths()
-    with tempfile.TemporaryDirectory(prefix="termlo-install-") as state:
-        install_in_directory(args, terminal, checked, interactive, state)
+    directory = nullcontext(preflight_dir) if preflight_dir else tempfile.TemporaryDirectory(prefix="termlo-install-")
+    with directory as state:
+        install_in_directory(args, terminal, preflight_dir is not None, interactive, state)
 
 
 def install_in_directory(args, terminal, checked, interactive, state):
@@ -387,7 +394,7 @@ def install_in_directory(args, terminal, checked, interactive, state):
     folder = config_dir()
     folder.mkdir(mode=0o700, parents=True, exist_ok=True)
     terminal_context = open("/dev/tty", encoding="utf-8") if interactive else nullcontext(terminal)
-    with terminal_context as terminal, (folder / "install.lock").open("a") as lock:
+    with terminal_context as terminal, pairing.account_file(folder / "install.lock", replace=False).open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         channels = {"cn": "中国大陆，按系统选择可用软件源", "global": "海外，优先使用系统源和官方源",
                     "auto": "未识别到出口地区，优先使用系统源"}
@@ -442,7 +449,7 @@ def add_endpoint_options(parser):
     parser.add_argument("--host-key", help="sshd 使用的主机公钥文件（.pub）")
 
 
-def main(checked=False):
+def main(preflight_dir=None):
     parser = argparse.ArgumentParser(prog="termlo", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     setup = commands.add_parser("install", help="安装或更新当前用户的远程开发环境")
@@ -468,16 +475,16 @@ def main(checked=False):
             # A command loaded from the zipapp may have waited for removal to finish.
             if args.command != "uninstall" and not Path(sys.argv[0]).exists():
                 raise ValueError("此账号的 Termlo 已卸载。")
-            dispatch(args, checked)
+            dispatch(args, preflight_dir)
     except (EOFError, KeyboardInterrupt):
         parser.exit(130, "\n操作已取消。\n")
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         parser.exit(1, f"Termlo：{error}\n")
 
 
-def dispatch(args, checked=False):
+def dispatch(args, preflight_dir=None):
     if args.command == "install":
-        install(args, checked=checked, interactive=len(sys.argv) == 2)
+        install(args, preflight_dir=preflight_dir, interactive=len(sys.argv) == 2)
     elif args.command == "uninstall":
         add_tool_paths()
         uninstall.run(config_dir(), args.keep_tools)

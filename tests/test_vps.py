@@ -129,6 +129,7 @@ class InstallerTests(unittest.TestCase):
 
     def prepare_fake_linux_tools(self):
         command(self.bin / "sudo", '[ "$1" != -n ] || shift; [ "$1" != true ] || exit 0; exec "$@"')
+        command(self.bin / "dpkg", '[ "$1" = --version ]')
         for name in ("tmux", "git", "adb", "claude"):
             command(self.home / name, 'exit 0')
         command(self.home / "chromium", '''
@@ -138,7 +139,14 @@ echo '<html><head><title>termlo-browser-ready</title></head></html>' ''')
         command(self.bin / "apt-get", '''
 [ "$1" != --version ] || exit 0
 echo "apt $*" >> "$EVENTS"
-case " $* " in *" --download-only "*) exit 0 ;; esac
+case " $* " in *" --download-only "*)
+    archives=''
+    for arg do case "$arg" in Dir::Cache::archives=*) archives=${arg#*=} ;; esac; done
+    if [ -n "$archives" ]; then
+        for arg do case "$arg" in git|tmux|adb|chromium|chromium-sandbox) echo deb > "$archives/${arg}_1_amd64.deb" ;; esac; done
+    fi
+    exit 0 ;;
+esac
 if [ "$1" = install ]; then
     for tool in "$@"; do
         case "$tool" in

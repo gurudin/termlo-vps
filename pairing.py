@@ -19,13 +19,31 @@ ED25519_PREFIX = b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20"
 RECEIPT = "termlo-paired-v2"
 
 
+def account_file(path, *, replace):
+    """Check a lock opened for append or a key file updated by atomic rename."""
+    try:
+        target = path.resolve()
+    except (OSError, RuntimeError) as error:
+        raise ValueError(f"请检查 {path} 的链接是否循环，以及当前 SSH 账号能否访问其目标。") from error
+    if path.is_symlink() and (replace or not target.exists()):
+        if not target.parent.is_dir() or not os.access(target.parent, os.W_OK | os.X_OK):
+            raise ValueError(f"请将 {path} 的链接指向现有且当前账号可写的目录中的文件。当前目标为 {target}。")
+    if target.exists():
+        if not target.is_file():
+            raise ValueError(f"请移开占用 {target} 的目录或特殊文件，使该位置可用于普通文件。")
+        if not os.access(target, os.R_OK if replace else os.W_OK):
+            access = "读取" if replace else "写入"
+            raise ValueError(f"请让当前 SSH 账号能够{access}文件 {target}。")
+    return target
+
+
 @contextmanager
 def locked_authorized_keys():
     directory = Path.home() / ".ssh"
     directory.mkdir(mode=0o700, exist_ok=True)
-    with (directory / ".termlo-pair.lock").open("a") as lock:
+    with account_file(directory / ".termlo-pair.lock", replace=False).open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        path = (directory / "authorized_keys").resolve()
+        path = account_file(directory / "authorized_keys", replace=True)
         try:
             lines = path.read_bytes().splitlines(keepends=True)
         except FileNotFoundError:

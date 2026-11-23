@@ -1,4 +1,5 @@
 """Exercise the actual single-file installer before granting it any system changes."""
+import json
 import os
 import re
 import shutil
@@ -14,6 +15,7 @@ import native_browser
 
 class DoctorTests(unittest.TestCase):
     setUp = _Stream.setUp
+    run_in_terminal = _Stream.run_in_terminal
 
     def run_installer(self, *args):
         return subprocess.run(["/bin/sh", str(self.bundle), *args], env=self.env, text=True,
@@ -53,6 +55,21 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(run.stdout, "")
         self.assertFalse((self.home / ".ssh").exists())
         self.assertFalse((self.home / "config/termlo/installed-components.json").exists())
+
+    def test_apt_repair_uses_working_tools_and_identifies_when_rescue_is_needed(self):
+        tools = self.home / "bin"
+        (tools / "apt-get").unlink()
+        command(tools / "apt", "exit 127")
+        command(tools / "dpkg", '[ "$1" != --print-architecture ] || echo amd64')
+        result = self.run_installer("--sync-only")
+        self.assert_checklist(result)
+        self.assertIn("dpkg -i ./*.deb", result.stderr)
+        self.assertNotIn("apt install -y --reinstall apt", result.stderr)
+        command(tools / "dpkg", "exit 127")
+        result = self.run_installer("--sync-only")
+        self.assert_checklist(result)
+        self.assertIn("救援环境", result.stderr)
+        self.assertNotIn("目录运行 dpkg -i ./*.deb", result.stderr)
 
     def test_an_active_session_with_no_host_key_response_stops_before_changes(self):
         command(self.home / "bin/ssh-keyscan", "exit 1")
@@ -124,20 +141,122 @@ class DoctorTests(unittest.TestCase):
         tools = self.home / "bin"
         (tools / "tmux").unlink()
         (tools / "mkdir").symlink_to(shutil.which("mkdir"))
+        command(tools / "dpkg", '[ "$1" = --version ]')
         command(tools / "sudo", '[ "$1 $2" = "-n true" ]')
         command(tools / "apt-get", '''
 [ "$1" != --version ] || exit 0
 echo "$*" >> "$HOME/apt-calls"
-case "$*" in
-    *Dir::State::lists="$HOME"/*/apt-lists*) exit 0 ;;
-    *) exit 1 ;;
+for arg do case "$arg" in Dir::Cache::archives=*) archives=${arg#*=} ;; esac; done
+case " $* " in *" Dir::State::lists=$HOME/"*"/apt-system "*) ;; *) exit 1 ;; esac
+case " $* " in
+    *" update "*) exit 0 ;;
+    *" --download-only "*) echo deb > "$archives/tmux_1_amd64.deb" ;;
+    *) exit 100 ;;
 esac''')
         result = self.run_installer("--check")
         self.assert_checklist(result)
         self.assertIn("[通过] tmux 安装来源", result.stderr)
         calls = (self.home / "apt-calls").read_text().splitlines()
         self.assertEqual(sum(line.endswith(" update") for line in calls), 1)
-        self.assertTrue(all(line.startswith("-s ") or line.endswith(" update") for line in calls))
+        self.assertTrue(all("--download-only" in line or line.endswith(" update") for line in calls))
+        self.assertFalse((self.home / ".local").exists())
+
+    def test_cached_apt_metadata_cannot_pass_an_unreachable_or_missing_download(self):
+        tools = self.home / "bin"
+        (tools / "tmux").unlink()
+        (tools / "mkdir").symlink_to(shutil.which("mkdir"))
+        command(tools / "sudo", '[ "$1 $2" = "-n true" ]')
+        command(tools / "apt-get", '''
+case "$1" in --version|-s) exit 0 ;; esac
+case " $* " in
+    *" update "*) [ "$FAIL" != index ] ;;
+    *" --download-only "*) [ "$FAIL" = no_archive ] ;;
+    *) echo unexpected > "$HOME/mutation"; exit 100 ;;
+esac''')
+        for failure in ("index", "download", "no_archive"):
+            with self.subTest(failure=failure):
+                self.env["FAIL"] = failure
+                result = self.run_installer("--without-claude")
+                self.assert_checklist(result)
+                self.assertIn("[未通过] tmux 安装来源", result.stderr)
+                self.assertIn("apt-get install -y tmux", result.stderr)
+                self.assertFalse((self.home / "config/termlo/install.lock").exists())
+                self.assertFalse((self.home / "mutation").exists())
+
+    def test_lock_files_and_linked_ssh_keys_are_checked_before_the_wizard(self):
+        config = self.home / "config/termlo"
+        ssh = self.home / ".ssh"
+        ssh.mkdir()
+        install_lock = config / "install.lock"
+        pair_lock = ssh / ".termlo-pair.lock"
+        install_lock.mkdir()
+        pair_lock.mkdir()
+        link = ssh / "authorized_keys"
+        keys = self.home / "previous-account/keys"
+        link.symlink_to(keys)
+        before = (config / "connection.json").read_bytes()
+        status, transcript = self.run_in_terminal(["-c", INSTALL_COMMAND])
+        self.assertNotEqual(status, 0, transcript)
+        for label in ("安装锁文件", "SSH 配对锁文件", "SSH 授权文件"):
+            self.assertIn("[未通过] " + label, transcript)
+        self.assertNotIn("1/3", transcript)
+        self.assertFalse((config / "installed-components.json").exists())
+        self.assertFalse((self.home / ".local").exists())
+        self.assertEqual((config / "connection.json").read_bytes(), before)
+        self.assertFalse(keys.parent.exists())
+        install_lock.rmdir()
+        pair_lock.rmdir()
+        keys.parent.mkdir()
+        keys.write_text("# existing keys\n")
+        result = self.run_installer("--sync-only")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(link.is_symlink())
+        self.assertTrue(keys.read_bytes().startswith(b"# existing keys\n"))
+        self.assertIn(b" termlo-pair:", keys.read_bytes())
+
+    def test_agent_version_requires_successful_exit(self):
+        agent = self.home / ".mutagen/agents/0.18.1/mutagen-agent"
+        command(agent, "echo 0.18.1; exit 1")
+        self.env["TERMLO_MUTAGEN_ARCHIVE"] = str(self.home / "missing.tar.gz")
+        result = self.run_installer("--sync-only")
+        self.assert_checklist(result)
+        self.assertIn("[未通过] Mutagen 同步代理", result.stderr)
+        self.assertFalse((self.home / "config/termlo/installed-components.json").exists())
+
+    def test_pairing_requires_functional_ed25519_key_generation(self):
+        keygen = self.home / "bin/ssh-keygen"
+        self.env["REAL_KEYGEN"] = str(keygen.resolve())
+        keygen.unlink()
+        command(keygen, 'if [ "$1" = -q ]; then exit 1; fi\nexec "$REAL_KEYGEN" "$@"')
+        result = self.run_installer("--sync-only")
+        self.assert_checklist(result)
+        self.assertIn("[通过] SSH 服务及主机密钥", result.stderr)
+        self.assertIn("[未通过] SSH 配对密钥", result.stderr)
+        self.assertIn("--reinstall openssh-client", result.stderr)
+        self.assertFalse((self.home / ".ssh").exists())
+        self.assertFalse((self.home / "config/termlo/installed-components.json").exists())
+
+    def test_legacy_null_ports_and_invalid_saved_endpoints(self):
+        connection = self.home / "config/termlo/connection.json"
+        for invalid in ({"name": "   "}, {"host": "invalid host"}):
+            with self.subTest(invalid=invalid):
+                connection.write_text(json.dumps(invalid))
+                result = self.run_installer("--sync-only")
+                self.assert_checklist(result)
+                self.assertIn("[未通过] 已有文件 connection.json", result.stderr)
+                self.assertEqual(json.loads(connection.read_text()), invalid)
+                self.assertFalse((self.home / ".ssh").exists())
+        connection.write_text('{"port": null, "local_port": null}')
+        result = self.run_installer("--sync-only")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(connection.read_text())["port"], 2202)
+
+    def test_missing_uname_still_prints_the_checklist(self):
+        (self.home / "bin/uname").unlink()
+        result = self.run_installer("--sync-only")
+        self.assert_checklist(result)
+        self.assertIn("[未通过] 远程系统", result.stderr)
+        self.assertIn("uname -s", result.stderr)
         self.assertFalse((self.home / ".local").exists())
 
     def test_directory_at_agent_destination_stops_before_creating_state(self):

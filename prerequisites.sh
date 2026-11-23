@@ -25,6 +25,31 @@ as_root() {
 
 apt_ready() { has apt-get && apt-get --version >/dev/null 2>&1; }
 
+# Both the checklist and the installation use these distribution-signed sources.
+china_sources() (
+    [ -r "$1" ] || return 1
+    . "$1"
+    suite=${VERSION_CODENAME:-}
+    arch=$2
+    case $suite in ''|[!a-z]*|*[!a-z0-9-]*) return 1 ;; esac
+    case $arch in ''|[!a-z0-9]*|*[!a-z0-9-]*) return 1 ;; esac
+    mirror=https://mirrors.tuna.tsinghua.edu.cn
+    case ${ID:-} in
+        debian)
+            archive=$mirror/debian; security=$mirror/debian-security
+            components=main; keyring=/usr/share/keyrings/debian-archive-keyring.gpg ;;
+        ubuntu)
+            case $arch in amd64|i386) archive=$mirror/ubuntu ;; *) archive=$mirror/ubuntu-ports ;; esac
+            security=$archive; components='main restricted universe multiverse'
+            keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg ;;
+        *) return 1 ;;
+    esac
+    options="arch=$arch signed-by=$keyring"
+    printf 'deb [%s] %s %s %s\n' "$options" "$archive" "$suite" "$components" \
+        "$options" "$archive" "$suite-updates" "$components" \
+        "$options" "$security" "$suite-security" "$components"
+)
+
 cached_apt() (
     has dpkg && has dpkg-deb || return 1
     arch=$(dpkg --print-architecture) || return 1
@@ -78,17 +103,26 @@ META
 )
 
 apt_recovery_hint() {
-    if has apt; then printf '%sapt update && %sapt install -y --reinstall apt\n' "$1" "$1"
-    elif has aptitude; then printf '%saptitude update && %saptitude reinstall -y apt\n' "$1" "$1"
+    if ! dpkg --version >/dev/null 2>&1; then
+        printf '%s\n' '请用同版本 Debian/Ubuntu 的救援环境挂载原系统，并取得匹配架构的 dpkg、apt 及依赖的官方 .deb。若原系统挂载在 /mnt，在放置这些包的目录以管理员身份运行 dpkg --root=/mnt -i ./*.deb。'
+        return 1
+    elif apt --version >/dev/null 2>&1; then printf '%sapt update && %sapt install -y --reinstall apt\n' "$1" "$1"
+    elif aptitude --version >/dev/null 2>&1; then printf '%saptitude update && %saptitude reinstall -y apt\n' "$1" "$1"
     elif deb=$(cached_apt); then printf '%sdpkg -i "%s"\n' "$1" "$deb"
     elif metadata=$(indexed_apt); then
         read -r url sha <<META
 $metadata
 META
-        printf '可从发行版软件源恢复。手动运行 (d=$(mktemp -d) && cd "$d" && curl -fLO %s && echo "%s  %s" | sha256sum -c - && %sdpkg -i %s)\n' "$url" "$sha" "${url##*/}" "$1" "${url##*/}"
+        if [ -x /usr/lib/apt/apt-helper ]; then
+            printf '用发行版索引中的校验值恢复：(d=$(mktemp -d) && /usr/lib/apt/apt-helper download-file %s "$d/apt.deb" SHA256:%s && %sdpkg -i "$d/apt.deb")\n' "$url" "$sha" "$1"
+        else
+            printf '可从发行版软件源恢复。手动运行 (d=$(mktemp -d) && cd "$d" && curl -fLO %s && echo "%s  %s" | sha256sum -c - && %sdpkg -i %s)\n' "$url" "$sha" "${url##*/}" "$1" "${url##*/}"
+        fi
     elif has python3 && python3 -B -c 'import apt' 2>/dev/null; then
         printf "%spython3 -c 'import apt; c=apt.Cache(); c.update(); c.open(); p=c[\"apt\"]; c._depcache.set_reinstall(p._pkg, True) if p.is_installed else p.mark_install(); c.commit()'\n" "$1"
-    elif has pkcon; then printf '%spkcon --noninteractive install apt\n' "$1"
+    elif has pkcon && pkcon get-roles >/dev/null 2>&1 &&
+        [ "$(dpkg-query -W -f='${db:Status-Status}' apt 2>/dev/null || :)" = not-installed ]; then
+        printf '%spkcon --noninteractive install apt\n' "$1"
     else
         printf '从本机发行版、版本及架构对应的官方安装介质取出 apt 和所需依赖的 .deb，放入一个空目录。在该目录运行 %sdpkg -i ./*.deb && apt-get --version\n' "$1"
         return 1
@@ -132,6 +166,9 @@ ENDPOINT
             while read -r server kind data comment; do
                 case $kind in ssh-ed25519|ecdsa-sha2-*|ssh-rsa)
                     [ -n "$data" ] || continue
+                    if has ssh-keygen; then
+                        printf '%s %s\n' "$kind" "$data" | ssh-keygen -E sha256 -lf - >/dev/null 2>&1 || continue
+                    fi
                     printf '%s %s %s\n' "$port" "$kind" "$data"
                     found=1 ;; esac
             done <<KEYS

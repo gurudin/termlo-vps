@@ -76,6 +76,17 @@ if [ "$ID" = debian ]; then
     # and must leave the machine's package lists untouched.
     mv /var/lib/apt/lists "$work/original-lists"
     mkdir -p /var/lib/apt/lists/partial
+    # A normal SSH account must also be able to verify a signed package before sudo.
+    runuser -u nobody -- sh -ec '
+        cd /tmp
+        . /src/prerequisites.sh
+        . /src/doctor.sh
+        scratch=$(mktemp -d)
+        trap '\''rm -rf -- "$scratch"'\'' EXIT
+        release=/etc/os-release
+        apt_packages_available tmux
+        test -s "$scratch"/apt-archives/tmux_*.deb
+    '
     sh /src/install.sh --check --host 127.0.0.1
     for index in /var/lib/apt/lists/*_Packages*; do test ! -e "$index"; done
     mv /var/lib/apt/lists "$work/lists-after-check"

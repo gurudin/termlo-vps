@@ -28,10 +28,10 @@ def correct_version(path):
     if not path.is_file() or not os.access(path, os.X_OK):
         return False
     try:
-        result = subprocess.run([str(path), "version"], capture_output=True, text=True, timeout=10)
+        result = subprocess.run([str(path), "version"], capture_output=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         return False
-    return result.returncode == 0 and result.stdout.strip() == VERSION
+    return result.returncode == 0 and result.stdout.strip() == VERSION.encode("ascii")
 
 
 def release_info():

@@ -26,6 +26,24 @@ writable_directory() (
     [ -d "$dir" ] && [ -w "$dir" ] && [ -x "$dir" ]
 )
 
+doctor_account_file() {
+    if [ -e "$2" ] || [ -L "$2" ]; then
+        if [ -n "$py" ] && [ -n "$payload" ]; then
+            if ! reason=$("$py" -IB -c 'import sys; sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+from pairing import account_file
+try: account_file(Path(sys.argv[2]), replace=sys.argv[3] == "keys")
+except (OSError, ValueError, RuntimeError) as error: sys.exit(str(error))' "$payload" "$2" "$3" 2>&1); then
+                doctor_block "$1  $2" "$reason"; return
+            fi
+        elif [ -L "$2" ] || [ ! -f "$2" ] ||
+             { [ "$3" = keys ] && [ ! -r "$2" ]; } || { [ "$3" = lock ] && [ ! -w "$2" ]; }; then
+            doctor_block "$1  $2" '请确认此位置是当前账号可用的普通文件。若为链接，先按清单补齐 Python 和安装包以核验其目标。'; return
+        fi
+    fi
+    doctor_pass "$1  $2 可用"
+}
+
 # These are tools Termlo installs. A missing tool passes only if its delivery
 # route can be verified. Installer prerequisites themselves must already work.
 doctor_component() {
@@ -38,6 +56,9 @@ doctor_component() {
         case $names in '--cask '*) brew_cask=1 ;; *) brew_formula=1 ;; esac
     fi
     fix=$(package_hint "$@")
+    if [ "$family" = apt ] && [ "$manager_ok" = 1 ]; then
+        printf '  正在临时下载并校验 %s 软件包…\n' "$names" >&2
+    fi
     if [ "$manager_ok" = 1 ] && package_available "$names"; then
         doctor_pass "$label 安装来源  已确认 $names 可用，安装时补齐"
     else
@@ -46,30 +67,66 @@ doctor_component() {
 }
 
 apt_packages_available() (
-    if apt-get -s --no-remove --no-install-recommends install "$@" >/dev/null 2>&1; then return 0; fi
-    # Minimal images can have empty indexes. Resolve against temporary lists;
-    # do not update the host's APT state or run its post-update hooks.
-    [ -n "$scratch" ] && has mkdir || return 1
-    if [ ! -d "$scratch/apt-lists" ]; then
-        mkdir -p "$scratch/apt-lists/partial" || return 1
-        cat > "$scratch/apt.conf" <<'APT'
+    [ -n "$scratch" ] && has mkdir && has cat || return 1
+    if [ ! -f "$scratch/apt.conf" ]; then
+        mkdir -p "$scratch/apt-archives/partial" || return 1
+        cat > "$scratch/apt.conf" <<'APT' || return 1
 #clear APT::Update::Pre-Invoke;
 #clear APT::Update::Post-Invoke;
 #clear APT::Update::Post-Invoke-Success;
+#clear DPkg::Pre-Install-Pkgs;
+#clear DPkg::Pre-Invoke;
+#clear DPkg::Post-Invoke;
+Debug::NoLocking "true";
 Dir::Cache::pkgcache "";
 Dir::Cache::srcpkgcache "";
 APT::Update::Error-Mode "any";
 Acquire::http::Timeout "8";
 Acquire::https::Timeout "8";
 APT
-        if apt-get -c "$scratch/apt.conf" -o "Dir::State::lists=$scratch/apt-lists" update >/dev/null 2>&1; then
-            : > "$scratch/apt-ready"
-        fi
     fi
-    [ -f "$scratch/apt-ready" ] &&
-        apt-get -s -c "$scratch/apt.conf" -o "Dir::State::lists=$scratch/apt-lists" \
-            --no-remove --no-install-recommends install "$@" >/dev/null 2>&1
+    # Work without sudo. A stale local index or an unreachable archive must not
+    # pass. APT verifies downloads against the signed index, without running dpkg.
+    routes='system cn'
+    case ${TERMLO_INSTALL_NETWORK:-} in cn|cn' '*) routes='cn system' ;; esac
+    if [ -s "$scratch/preferred" ]; then
+        read -r preferred < "$scratch/preferred"
+        case $preferred in cn) routes='cn system' ;; system) routes='system cn' ;; esac
+    fi
+    for route in $routes; do
+        lists=$scratch/apt-$route
+        if [ ! -d "$lists" ]; then
+            mkdir -p "$lists/partial" || return 1
+            if [ "$route" = cn ]; then
+                arch=$(dpkg --print-architecture 2>/dev/null) && china_sources "$release" "$arch" > "$lists/sources.list" || continue
+            fi
+            if doctor_apt_get update; then : > "$lists/ready"; fi
+        fi
+        [ -f "$lists/ready" ] || continue
+        doctor_apt_get --download-only --reinstall --no-remove --no-install-recommends -y install "$@" || continue
+        # APT can exit zero if a damaged installed package has no downloadable candidate.
+        set +f
+        for package do
+            found=0
+            for deb in "$scratch/apt-archives/${package}_"*.deb; do
+                if [ -s "$deb" ]; then found=1; break; fi
+            done
+            [ "$found" = 1 ] || continue 2
+        done
+        if [ "$route" != "${routes%% *}" ]; then printf '%s\n' "$route" > "$scratch/preferred" || return 1; fi
+        return 0
+    done
+    return 1
 )
+
+doctor_apt_get() {
+    if [ "$route" = cn ]; then
+        set -- -o "Dir::Etc::sourcelist=$lists/sources.list" -o Dir::Etc::sourceparts=- "$@"
+    fi
+    apt-get -c "$scratch/apt.conf" -o "Dir::State::lists=$lists" \
+        -o "Dir::Cache::archives=$scratch/apt-archives" -o "Dir::Log=$lists" \
+        -o "Dir::State::extended_states=$lists/extended_states" "$@" >/dev/null 2>&1
+}
 
 package_available() (
     # Names and options come exclusively from doctor_component's fixed package lists.
@@ -107,8 +164,16 @@ package_available() (
 
 check_agent() (
     agent=$agent_dir/mutagen-agent
-    if [ -x "$agent" ] && [ "$("$agent" version 2>/dev/null)" = "$version" ]; then
-        printf 'Mutagen 同步代理  %s 已就绪\n' "$version"; return 0
+    if [ -f "$agent" ] && [ -x "$agent" ]; then
+        if [ -z "$py" ] || [ -z "$payload" ]; then
+            echo '先按清单补齐 Python 或修复安装包，再检查已有同步代理。'; return 1
+        fi
+        if "$py" -IB -c 'import sys; sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+from sync_agent import correct_version
+sys.exit(not correct_version(Path(sys.argv[2])))' "$payload" "$agent" 2>/dev/null; then
+            printf 'Mutagen 同步代理  %s 已就绪\n' "$version"; return 0
+        fi
     fi
     case $system in Linux) os=linux ;; Darwin) os=darwin ;; *) echo '请使用支持的 Linux 或 macOS 设备。'; return 1 ;; esac
     case $machine in x86_64) arch=amd64 ;; arm64|aarch64) arch=arm64 ;; *) echo '请选择支持的 64 位处理器。'; return 1 ;; esac
@@ -229,12 +294,14 @@ termlo_doctor() (
     done
     case "$system/$machine" in Linux/x86_64|Linux/aarch64|Linux/arm64|Darwin/x86_64|Darwin/arm64)
         doctor_pass "远程系统  $system $machine" ;;
+        未知/*|*/未知) doctor_block '远程系统  无法取得系统或处理器型号' '请恢复 uname 工具或系统 PATH，确认 uname -s 和 uname -m 都能输出结果。' ;;
         *) doctor_block "远程系统  $system $machine" '请使用 64 位 Intel/AMD 或 ARM 的 Linux 或 macOS 设备。' ;;
     esac
     uid=$(id -u) || uid=''
     priv=''
     if [ "$uid" != 0 ]; then
-        if has doas && ! has sudo; then priv='doas '; else priv='sudo '; fi
+        if has sudo; then priv='sudo '
+        elif has doas; then priv='doas '; fi
     fi
     if [ -z "$uid" ] || { [ "$system" = Darwin ] && [ "$uid" = 0 ]; } ||
        { [ "$uid" = 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; }; then
@@ -252,9 +319,6 @@ termlo_doctor() (
     if [ -d "$HOME/.local/bin/termlo" ]; then
         doctor_block '命令安装位置已被目录占用' '请移动该目录后重试：mv "$HOME/.local/bin/termlo" "$HOME/.local/bin/termlo-directory"'
     fi
-    if [ -e "$HOME/.ssh/authorized_keys" ] && ! { [ -f "$HOME/.ssh/authorized_keys" ] && [ -r "$HOME/.ssh/authorized_keys" ]; }; then
-        doctor_block 'SSH 授权文件无法读取' '请将 ~/.ssh/authorized_keys 恢复为当前账号可读的普通文件。'
-    else doctor_pass 'SSH 授权文件  可创建或读取'; fi
     if [ "$system" = Darwin ]; then family=brew; else family=$(linux_manager "$release") || family=unknown; fi
     if [ -n "$payload" ]; then doctor_pass '安装程序  可读取'
     else
@@ -284,6 +348,9 @@ termlo_doctor() (
     py=$(find_python) || py=''
     if [ -n "$py" ]; then doctor_pass "Python  $("$py" -V 2>&1)，TLS 和压缩模块可用"
     else doctor_block 'Python  需要 3.8 或更高版本且含 TLS 和压缩模块' "$(package_hint python3 python3.11 python3 python)"; fi
+    doctor_account_file '安装锁文件' "$config/install.lock" lock
+    doctor_account_file 'SSH 配对锁文件' "$HOME/.ssh/.termlo-pair.lock" lock
+    doctor_account_file 'SSH 授权文件' "$HOME/.ssh/authorized_keys" keys
     for record in connection.json installed-components.json; do
         if [ ! -e "$config/$record" ] && [ ! -L "$config/$record" ]; then continue; fi
         if [ -z "$payload" ] || [ -z "$py" ]; then
@@ -312,6 +379,24 @@ except (OSError, ValueError) as error: sys.exit(str(error))' "$payload" "$config
     if [ -z "$missing" ]; then doctor_pass 'SSH 客户端工具  ssh、scp、ssh-keygen、ssh-keyscan'
     elif [ -n "${SSH_CONNECTION:-}$key" ]; then doctor_block "SSH 客户端工具  缺少${missing}，无法核验现有连接" "$ssh_fix"
     else doctor_component "SSH 客户端工具（缺少${missing}）" openssh-client openssh-clients 'openssh-client-default openssh-keygen' openssh; fi
+    if has ssh-keygen; then
+        if [ -n "$scratch" ] && ssh-keygen -q -t ed25519 -N '' -C '' -f "$scratch/pairing-check" </dev/null >/dev/null 2>&1 &&
+                ssh-keygen -E sha256 -lf "$scratch/pairing-check.pub" >/dev/null 2>&1; then
+            doctor_pass 'SSH 配对密钥  可生成 Ed25519 密钥并核验指纹'
+        else
+            case $family in
+                apt) fix="${priv}apt-get update && ${priv}apt-get install -y --reinstall openssh-client" ;;
+                rpm) fix="${priv}${manager:-dnf} reinstall -y openssh" ;;
+                apk) fix="${priv}apk fix --reinstall openssh-keygen" ;;
+                brew) fix='先确认 /usr/bin/ssh-keygen 可用，或通过 Homebrew 恢复：
+             if brew list --versions openssh >/dev/null; then brew reinstall openssh; else brew install openssh; fi
+             export PATH="$(brew --prefix openssh)/bin:$PATH"' ;;
+                *) fix='请修复系统 OpenSSH 中的 ssh-keygen' ;;
+            esac
+            doctor_block 'SSH 配对密钥  无法生成 Ed25519 密钥或核验指纹' "确认临时目录可写。若设备策略限制 Ed25519，请向管理员确认该设备能否用于配对。OpenSSH 损坏时可按以下方法修复：
+             ${fix}"
+        fi
+    fi
 
     case "$port" in ''|*[!0-9]*) valid_port=0 ;; *) valid_port=$port ;; esac
     if ! { [ "$valid_port" -gt 0 ] && [ "$valid_port" -le 65535 ]; } 2>/dev/null; then
@@ -370,13 +455,19 @@ ENDPOINT
         else doctor_block 'Homebrew 应用安装目录不可写' '请确认 brew --caskroom 指向的目录和 ~/Applications 均可写，或请管理员安装清单中缺少的应用。'; fi
     fi
     if [ "$packages_needed" = 1 ] && [ "$family" != brew ]; then admin_needed=1; fi
+    if [ "$packages_needed" = 1 ] && [ "$family" = apt ] && [ "$manager_ok" = 1 ] && ! dpkg --version >/dev/null 2>&1; then
+        hint=$(apt_recovery_hint "$priv") || :
+        doctor_block 'Debian 软件安装工具  dpkg 不可用' "$hint"
+    fi
     if [ "$admin_needed" = 0 ]; then doctor_pass '安装权限  本次无需系统提权'
     elif [ "$uid" = 0 ]; then doctor_pass '安装权限  当前账号有系统安装权限'
+    elif [ -z "$priv" ]; then doctor_block '安装权限  当前账号无法安装系统组件' '请让管理员以 root 身份补齐上方软件，或配置 sudo 或 doas 后回到当前 SSH 账号重试。'
     elif "${priv% }" -n true </dev/null >/dev/null 2>&1; then doctor_pass '安装权限  已验证系统安装权限'
     elif [ "$check_only" = 0 ] && [ "$failed" = 0 ] && ( : </dev/tty ) 2>/dev/null && as_root true </dev/tty; then doctor_pass '安装权限  管理员已授权'
     else doctor_block '安装权限  尚未取得系统安装权限' "请在交互式 SSH 终端运行 ${priv}true 完成管理员授权，或请管理员按清单补齐组件。"; fi
     if [ "$full" = 1 ]; then printf '  Claude Code（选装）  %s\n' "$claude" >&2; fi
     if [ "$failed" -gt 0 ]; then
+        if [ "$uid" != 0 ] && [ -z "$priv" ]; then printf '上方涉及系统软件的补齐命令请由管理员执行，之后回到当前 SSH 账号重试。\n' >&2; fi
         printf '体检未通过。%s 项通过，%s 项未通过。按上方方法补齐后重新运行安装命令。\n' "$passed" "$failed" >&2
         return 1
     fi

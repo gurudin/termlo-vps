@@ -79,6 +79,27 @@ test "${FAIL:-}" != "$route $phase"''')
         self.assertEqual(self.apt("cn", FAIL="cn index").returncode, 0)
         self.assertEqual(self.log.read_text().splitlines(), ["cn index", "system index", "system download", "system install"])
 
+    def test_preflight_download_uses_the_signed_fallback_without_installing(self):
+        command(self.folder / "apt-get", '''
+route=system
+for arg do
+    case "$arg" in Dir::Etc::sourcelist=*) route=cn ;; Dir::Cache::archives=*) archives=${arg#*=} ;; esac
+done
+case " $* " in
+    *" update "*) echo "$route index" >> "$LOG" ;;
+    *" --download-only "*)
+        echo "$route download" >> "$LOG"
+        [ "$route" = cn ] && echo package > "$archives/tmux_1_arm64.deb" ;;
+    *) exit 100 ;;
+esac''')
+        check = subprocess.run(["sh", "-ec", '. "$1"; . "$2"; release=$3; scratch=$4; apt_packages_available tmux',
+                                "check", str(ROOT / "prerequisites.sh"), str(ROOT / "doctor.sh"),
+                                str(self.release), str(self.folder)], env=self.env, capture_output=True, text=True)
+        self.assertEqual(check.returncode, 0, check.stderr)
+        self.assertEqual(self.log.read_text().splitlines(), ["system index", "system download", "cn index", "cn download"])
+        self.assertIn("signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg",
+                      (self.folder / "apt-cn/sources.list").read_text())
+
     def test_download_failure_falls_back_and_remembers_working_source(self):
         self.assertEqual(self.apt("cn", FAIL="cn download").returncode, 0)
         self.assertEqual(self.apt("cn").returncode, 0)

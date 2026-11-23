@@ -49,32 +49,6 @@ detect_network() {
     printf 'auto\n'
 }
 
-china_sources() (
-    local release=$1 arch=$2 mirror=https://mirrors.tuna.tsinghua.edu.cn
-    local suite components keyring archive security
-    [[ -r $release ]] || return 1
-    . "$release"
-    suite=${VERSION_CODENAME:-}
-    [[ $suite =~ ^[a-z][a-z0-9-]*$ && $arch =~ ^[a-z0-9][a-z0-9-]*$ ]] || return 1
-    case ${ID:-} in
-        debian)
-            archive=$mirror/debian
-            security=$mirror/debian-security
-            components=main
-            keyring=/usr/share/keyrings/debian-archive-keyring.gpg ;;
-        ubuntu)
-            case $arch in amd64|i386) archive=$mirror/ubuntu ;; *) archive=$mirror/ubuntu-ports ;; esac
-            security=$archive
-            components='main restricted universe multiverse'
-            keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg ;;
-        *) return 1 ;;
-    esac
-    local options="arch=$arch signed-by=$keyring"
-    printf 'deb [%s] %s %s %s\n' "$options" "$archive" "$suite" "$components" \
-        "$options" "$archive" "$suite-updates" "$components" \
-        "$options" "$security" "$suite-security" "$components"
-)
-
 install_packages() {
     local release=$1 region=$2 state=$3 route preferred=system arch
     shift 3
@@ -85,6 +59,10 @@ install_packages() {
 
     for route in "${routes[@]}"; do
         options=(-o Acquire::http::Timeout=8 -o Acquire::https::Timeout=8 -o DPkg::Lock::Timeout=60)
+        # Only use the preflight archives when the same privileged user fetched them.
+        if (( EUID == 0 )) && [[ -d $state/apt-archives/partial ]]; then
+            options+=(-o "Dir::Cache::archives=$state/apt-archives")
+        fi
         if [[ $route == cn ]]; then
             arch=$(dpkg --print-architecture 2>/dev/null) || continue
             china_sources "$release" "$arch" > "$state/termlo.list" || continue

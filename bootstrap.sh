@@ -4,7 +4,7 @@ source_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 . "$source_dir/python-runtime.sh"
 . "$source_dir/prerequisites.sh"
 . "$source_dir/doctor.sh"
-system=$(uname -s)
+system=$(uname -s 2>/dev/null) || system=''
 case $system in Darwin) PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" ;; *) PATH="$PATH:/usr/sbin:/sbin" ;; esac
 export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"
 case ${1:-} in
@@ -24,6 +24,5 @@ if [ "$#" = 0 ]; then interactive=1; fi
 termlo_doctor "$source_dir" "$(cat "$source_dir/mutagen-releases.txt")" /etc/os-release "$scratch" "$interactive" "$@"
 for arg do [ "$arg" != --check ] || exit 0; done
 if [ "$#" = 0 ]; then exec </dev/tty; fi
-if [ -f "$scratch/agent.tar.gz" ]; then export TERMLO_MUTAGEN_ARCHIVE="$scratch/agent.tar.gz"; fi
 interpreter=$(find_python) || { echo 'Python 已不可用，请重新运行安装命令检查环境。' >&2; exit 1; }
-"$interpreter" -B "$source_dir/bootstrap.py" install "$@"
+"$interpreter" -B "$source_dir/bootstrap.py" "$scratch" install "$@"

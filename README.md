@@ -47,7 +47,7 @@ Linux 的 root 安装若新增了专用浏览器账号，卸载会核对账号�
 
 Ubuntu 的 Chromium 需要可用的 Snap 服务。Linux 用 root 安装时，安装器为浏览器准备无登录权限的 `termlo-browser` 系统账号，以普通用户身份运行 Chromium 并保留它的沙盒。SSH 连接和配对仍使用原账号。macOS 若需要安装 Homebrew 或系统工具，可能会要求管理员授权。
 
-APT 会按远端网络选择系统源或清华镜像，下载失败时尝试另一条线路。国内镜像设置仅用于本次安装，沿用发行版签名校验。远端无法下载 Mutagen 时，可以先取得对应平台的官方压缩包，再执行 `TERMLO_MUTAGEN_ARCHIVE=/完整路径/文件名 bash install.sh`，安装器仍会验证同一个 SHA-256。[清华镜像](https://mirrors.tuna.tsinghua.edu.cn/) · [Mutagen 发布包](https://github.com/mutagen-io/mutagen/releases/tag/v0.18.1)
+在 Debian、Ubuntu 上，缺少组件时，体检会在临时目录取得最新的签名索引，下载并校验所需的软件包。软件源下载失败时会尝试另一条线路。体检期间不会安装这些包或修改系统软件源。远端无法下载 Mutagen 时，按清单将对应平台的官方压缩包复制到设备上，设置 `TERMLO_MUTAGEN_ARCHIVE`，再运行本文开头的同一条安装命令。安装器会核对压缩包的 SHA-256。[清华镜像](https://mirrors.tuna.tsinghua.edu.cn/) · [Mutagen 发布包](https://github.com/mutagen-io/mutagen/releases/tag/v0.18.1)
 
 ## 在服务器核验
 
