@@ -71,7 +71,18 @@ case "$ID" in
         test ! -x /usr/bin/python3
         apk add --no-cache bash python3 curl ca-certificates ;;
 esac
-sh /src/install.sh --check --host 127.0.0.1
+if [ "$ID" = debian ]; then
+    # Fresh images may lack APT lists. The check may fetch disposable indexes,
+    # and must leave the machine's package lists untouched.
+    mv /var/lib/apt/lists "$work/original-lists"
+    mkdir -p /var/lib/apt/lists/partial
+    sh /src/install.sh --check --host 127.0.0.1
+    for index in /var/lib/apt/lists/*_Packages*; do test ! -e "$index"; done
+    mv /var/lib/apt/lists "$work/lists-after-check"
+    mv "$work/original-lists" /var/lib/apt/lists
+else
+    sh /src/install.sh --check --host 127.0.0.1
+fi
 if [ "$ID" != rocky ]; then test ! -e /etc/ssh/ssh_host_ed25519_key; fi
 install_termlo
 test -s /etc/ssh/ssh_host_ed25519_key

@@ -106,9 +106,7 @@ package_available() (
 )
 
 check_agent() (
-    version=${manifest%%'
-'*}
-    agent=$mutagen/agents/$version/mutagen-agent
+    agent=$agent_dir/mutagen-agent
     if [ -x "$agent" ] && [ "$("$agent" version 2>/dev/null)" = "$version" ]; then
         printf 'Mutagen 同步代理  %s 已就绪\n' "$version"; return 0
     fi
@@ -119,7 +117,10 @@ check_agent() (
         name=mutagen_${target}_v$version.tar.gz
         url=https://github.com/mutagen-io/mutagen/releases/download/v$version/$name
         file=${TERMLO_MUTAGEN_ARCHIVE:-$scratch/agent.tar.gz}
-        hint="请在可联网设备运行 curl -fL -o $name ${url}，把文件放到远端后设置 export TERMLO_MUTAGEN_ARCHIVE=\"\$PWD/$name\"。"
+        hint="请在可联网设备取得官方安装包：
+             curl -fL -o $name $url
+           将文件复制到远端，在文件所在目录设置：
+             export TERMLO_MUTAGEN_ARCHIVE=\"\$PWD/$name\""
         if [ -z "${TERMLO_MUTAGEN_ARCHIVE:-}" ]; then
             [ -n "$scratch" ] || { echo "请修复临时目录。$hint"; return 1; }
             api=https://api.github.com/repos/mutagen-io/mutagen/releases/assets/$asset
@@ -173,7 +174,22 @@ except (OSError, ValueError) as error: sys.exit(str(error))' "$payload" 2>&1); t
     if [ "$family" = apt ] && [ -r "$release" ] && ( . "$release"; [ "${ID:-}" = ubuntu ] ); then ubuntu=1; fi
     if [ "$ubuntu" = 1 ]; then fix="${priv}apt-get update && ${priv}apt-get install -y snapd && ${priv}systemctl enable --now snapd.socket && ${priv}snap install chromium"
     else fix=$(package_hint 'chromium chromium-sandbox' chromium chromium '--cask google-chrome'); fi
-    if [ "$status" != 3 ]; then doctor_block "远程浏览器  $browser" "${fix}；按上面的错误修复后重试。"; return; fi
+    if [ "$status" != 3 ]; then
+        if [ "$ubuntu" = 1 ]; then
+            fix="先修复或更新 Chromium。也可以安装可启动的 Google Chrome 后重新检查。
+             ${priv}apt-get update && ${priv}apt-get install -y snapd && ${priv}systemctl enable --now snapd.socket
+             if snap list chromium >/dev/null 2>&1; then ${priv}snap refresh chromium; else ${priv}snap install chromium; fi"
+        else
+            case $family in
+                apt) fix="${priv}apt-get update && ${priv}apt-get install -y --reinstall chromium chromium-sandbox" ;;
+                apk) fix="${priv}apk add --no-cache chromium && ${priv}apk fix --reinstall chromium" ;;
+                rpm) fix="${priv}${manager:-dnf} -y install chromium && ${priv}${manager:-dnf} -y reinstall chromium" ;;
+                brew) fix='从浏览器官网重新安装。通过 Homebrew 安装的 Chrome 可运行
+             brew reinstall --cask --appdir="$HOME/Applications" google-chrome' ;;
+            esac
+        fi
+        doctor_block "远程浏览器  $browser" "$fix"; return
+    fi
     if [ "$ubuntu" = 0 ]; then
         doctor_component '远程浏览器 Chromium' 'chromium chromium-sandbox' chromium chromium '--cask google-chrome'
     elif [ ! -d /run/systemd/system ] && [ ! -S /run/snapd.socket ]; then
@@ -226,8 +242,10 @@ termlo_doctor() (
     else doctor_pass "安装账号  UID $uid"; fi
     config=${XDG_CONFIG_HOME:-$HOME/.config}/termlo
     mutagen=${MUTAGEN_DATA_DIRECTORY:-$HOME/.mutagen}
-    for path in "$config" "$HOME/.ssh" "$HOME/.local/bin" "$mutagen/agents/${manifest%%'
-'*}"; do
+    version=${manifest%%'
+'*}
+    agent_dir=$mutagen/agents/$version
+    for path in "$config" "$HOME/.ssh" "$HOME/.local/bin" "$agent_dir"; do
         if writable_directory "$path"; then doctor_pass "安装目录  可写入 $path"
         else doctor_block "安装目录  无法写入 $path" "请确保 $path 是当前 SSH 用户可读写的目录，或恢复其上级目录的写权限。"; fi
     done
@@ -321,7 +339,10 @@ ENDPOINT
                 *) doctor_block '指定公钥与 SSH 服务不匹配' '去掉 --host-key 后重试，或提供该端口实际出示的公钥。' ;; esac
         else doctor_block '指定的 SSH 公钥不可读或无效' '请修复公钥文件的路径和权限，或去掉 --host-key 让安装器自动识别。'; fi
     fi
-    if agent=$(check_agent); then doctor_pass "$agent"
+    agent_target=$agent_dir/mutagen-agent
+    if [ -d "$agent_target" ]; then
+        doctor_block "Mutagen 同步代理  可执行文件路径被目录占用" "请将 $agent_target 目录移到其他位置，再重新运行安装命令。"
+    elif agent=$(check_agent); then doctor_pass "$agent"
     else doctor_block 'Mutagen 同步代理  无法验证安装来源或版本' "$agent"; fi
 
     if [ "$full" = 1 ]; then

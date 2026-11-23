@@ -88,6 +88,7 @@ class DoctorTests(unittest.TestCase):
         for item in ("tmux 安装来源", "远程浏览器", "当前 SSH 会话"):
             self.assertIn("[未通过] " + item, result.stderr)
         self.assertIn("apt-get install -y tmux", result.stderr)
+        self.assertIn("--reinstall chromium chromium-sandbox", result.stderr)
         self.assertEqual(result.stdout, "")
         self.assertFalse((self.home / "events").exists())
         self.assertFalse((self.home / ".local").exists())
@@ -138,6 +139,17 @@ esac''')
         self.assertEqual(sum(line.endswith(" update") for line in calls), 1)
         self.assertTrue(all(line.startswith("-s ") or line.endswith(" update") for line in calls))
         self.assertFalse((self.home / ".local").exists())
+
+    def test_directory_at_agent_destination_stops_before_creating_state(self):
+        agent = self.home / ".mutagen/agents/0.18.1/mutagen-agent"
+        agent.unlink()
+        agent.mkdir()
+        result = self.run_installer("--sync-only")
+        self.assert_checklist(result)
+        self.assertIn("可执行文件路径被目录占用", result.stderr)
+        self.assertIn(str(agent), result.stderr)
+        self.assertFalse((self.home / "config/termlo/install.lock").exists())
+        self.assertFalse((self.home / ".ssh").exists())
 
     def test_browser_falls_back_to_a_working_candidate_after_render_failure(self):
         bad = self.home / "bin/chromium"
