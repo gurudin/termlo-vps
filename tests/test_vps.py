@@ -183,7 +183,7 @@ fcntl.flock = trace_lock
     def test_port_discovered_after_first_sshd_start_is_used_unless_user_sets_public_port(self):
         (self.bin / "awk").symlink_to("/usr/bin/awk")
         command(self.bin / "sshd", 'echo "port 2248"')
-        command(self.bin / "sudo", '[ "$1 $2" = "-n true" ]')
+        command(self.bin / "sudo", '[ "$1" != -n ] || shift; [ "$1" != true ] || exit 0; exec "$@"')
         command(self.bin / "ssh-keyscan",
                 '[ -f "$HOME/up" ] && [ "$4" = 2248 ] || exit 1; printf "host "; cat "$HOME/ssh host key.pub"')
         helper = termlo.shell_helper

@@ -274,15 +274,16 @@ def ensure_claude(packages):
             packages.with_https_repair(lambda: subprocess.run(download, check=True))
             with packages.receipt.observe_claude():
                 subprocess.run(["bash", str(script), "stable"], stdout=sys.stderr, check=True)
-    subprocess.run(["claude", "--version"], stdout=sys.stderr, check=True)
+    subprocess.run(["claude", "--version"], stdin=subprocess.DEVNULL, stdout=sys.stderr, check=True, timeout=10)
 
 
 def ensure_browser(packages):
     root_browser = sys.platform == "linux" and os.geteuid() == 0
     if root_browser:
-        for command, package in (("useradd", "passwd"), ("runuser", "util-linux")):
-            if not shutil.which(command):
-                packages.install([package])
+        if not native_browser.check_install_account() and not shutil.which("useradd"):
+            packages.install(["passwd"])
+        if not shutil.which("runuser"):
+            packages.install(["util-linux"])
     with packages.receipt.observe_browser_user() if root_browser else nullcontext():
         if native_browser.executable():
             try:
@@ -293,10 +294,11 @@ def ensure_browser(packages):
                 note(f"现有浏览器检查未通过，正在修复。{error}")
         if sys.platform == "darwin":
             packages.cask("google-chrome")
-        elif OS_RELEASE.is_file() and any(line.strip() in ("ID=ubuntu", 'ID="ubuntu"', "ID='ubuntu'")
-                                          for line in OS_RELEASE.read_text().splitlines()):
-            if not shutil.which("snap"):
+        elif shell_helper("ubuntu_release", str(OS_RELEASE), check=False).returncode == 0:
+            if not tool_works(["snap", "--version"]):
                 packages.install(["snapd"])
+                if not tool_works(["snap", "--version"]):
+                    raise ValueError("安装 snapd 后仍无法运行 snap --version，请核对当前账号的 PATH 和 snapd 软件包。")
             packages.install_chromium_snap()
         else:
             packages.install(["chromium", "chromium-sandbox"] if packages.family == "apt" else ["chromium"])
@@ -311,6 +313,21 @@ def tool_works(command):
         return False
 
 
+def base_tool_state(command):
+    if tool_works(command):
+        return "ready"
+    path = shutil.which(command[0])
+    user_bins = {Path.home() / ".local/bin", Path.home() / ".npm-global/bin"}
+    if path and Path(path).parent in user_bins:
+        system_bins = os.defpath.split(os.pathsep)
+        if sys.platform == "darwin":
+            system_bins = ["/opt/homebrew/bin", "/usr/local/bin", *system_bins]
+        target = os.path.realpath(path)
+        if not any(os.path.realpath(os.path.join(folder, command[0])) == target for folder in system_bins):
+            return "override"
+    return "repair"
+
+
 def ensure_base_tools(packages):
     checks = [["git", "--version"], ["tmux", "-V"], ["adb", "version"]]
     missing = [command[0] for command in checks if not tool_works(command)]
@@ -319,7 +336,7 @@ def ensure_base_tools(packages):
         packages.cask("android-platform-tools")
     packages.install(missing)
     for command in checks:
-        subprocess.run(command, stdout=sys.stderr, check=True)
+        subprocess.run(command, stdin=subprocess.DEVNULL, stdout=sys.stderr, check=True, timeout=10)
     note("正在准备并验证远程登录浏览器…")
     ensure_browser(packages)
 
@@ -402,11 +419,13 @@ def publish_connection(folder, settings, details):
 
 
 def add_tool_paths():
-    os.environ["PATH"] = f"{Path.home()}/.local/bin:{Path.home()}/.npm-global/bin:" + os.environ["PATH"]
+    paths = [str(Path.home() / ".local/bin"), str(Path.home() / ".npm-global/bin")]
     if sys.platform == "darwin":
-        os.environ["PATH"] += ":/opt/homebrew/bin:/usr/local/bin"
-    else:
-        os.environ["PATH"] += ":/usr/sbin:/sbin"
+        paths.extend(["/opt/homebrew/bin", "/usr/local/bin"])
+    paths.extend(os.get_exec_path())
+    if sys.platform != "darwin":
+        paths.extend(["/usr/sbin", "/sbin"])
+    os.environ["PATH"] = os.pathsep.join(dict.fromkeys(paths))
 
 
 def install(args, terminal=None, preflight_dir=None, interactive=False):
@@ -457,8 +476,12 @@ def install_in_directory(args, terminal, checked, interactive, state):
         receipt = uninstall.Receipt(folder)
         receipt.save()
         packages = SystemPackages(region, state, receipt)
-        if any(not shutil.which(tool) for tool in ("ssh", "scp", "ssh-keygen", "ssh-keyscan")):
+        ssh_tools = ("ssh", "scp", "ssh-keygen", "ssh-keyscan")
+        if any(not shutil.which(tool) for tool in ssh_tools):
             packages.install(["openssh" if sys.platform == "darwin" else "openssh-client"])
+            missing = [tool for tool in ssh_tools if not shutil.which(tool)]
+            if missing:
+                raise ValueError("安装 OpenSSH 后仍找不到 " + "、".join(missing) + "，请核对当前 SSH 账号的 PATH 和软件包。")
         if sys.platform == "linux" and packages.family == "apt":
             shell_helper("restore_apt", stdout=sys.stderr)
         details = verified_identity(settings, packages, require_key=args.host_key is not None)

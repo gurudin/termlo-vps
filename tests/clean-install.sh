@@ -72,6 +72,14 @@ case "$ID" in
         apk add --no-cache bash python3 curl ca-certificates ;;
 esac
 if [ "$ID" = debian ]; then
+    cp /etc/ssh/sshd_config "$work/working-sshd-config"
+    printf '\nPort invalid\n' >> /etc/ssh/sshd_config
+    if TERMLO_MUTAGEN_ARCHIVE="$work/partial-download" sh /src/install.sh --check --sync-only --host 127.0.0.1 2>bad-sshd.log; then
+        echo "Unexpected success with an invalid server configuration"; exit 1
+    fi
+    grep -q '\[未通过\] SSH 服务配置' bad-sshd.log || { cat bad-sshd.log >&2; exit 1; }
+    test ! -e /etc/ssh/ssh_host_ed25519_key
+    mv "$work/working-sshd-config" /etc/ssh/sshd_config
     # Fresh images may lack APT lists. The check may fetch disposable indexes,
     # and must leave the machine's package lists untouched.
     mv /var/lib/apt/lists "$work/original-lists"
@@ -85,7 +93,7 @@ if [ "$ID" = debian ]; then
         trap '\''rm -rf -- "$scratch"'\'' EXIT
         release=/etc/os-release
         apt_packages_available tmux
-        test -s "$scratch"/apt-archives/tmux_*.deb
+        test -s "$(apt_archive_group "$scratch" tmux)"/*/tmux_*.deb
     '
     sh /src/install.sh --check --host 127.0.0.1
     for index in /var/lib/apt/lists/*_Packages*; do test ! -e "$index"; done
@@ -98,6 +106,19 @@ if [ "$ID" != rocky ]; then test ! -e /etc/ssh/ssh_host_ed25519_key; fi
 install_termlo
 test -s /etc/ssh/ssh_host_ed25519_key
 "$HOME/.local/bin/termlo" browser check
+python3 - <<'PY'
+import pwd, shutil, subprocess, sys
+from unittest.mock import patch
+sys.path.insert(0, "/src")
+import native_browser
+user = pwd.getpwnam(native_browser.ROOT_BROWSER_USER)
+which = shutil.which
+with patch.object(shutil, "which", side_effect=lambda name: None if name == "runuser" else which(name)):
+    prefix = native_browser.account_prefix(user, user.pw_dir, probe=True)
+    assert int(subprocess.check_output([*prefix, "id", "-u"])) == user.pw_uid != 0
+    assert int(subprocess.check_output([*prefix, "id", "-g"])) == user.pw_gid != 0
+    native_browser.check_for_install()
+PY
 
 ssh-keygen -q -t ed25519 -N '' -f device
 python3 - <<'PY'

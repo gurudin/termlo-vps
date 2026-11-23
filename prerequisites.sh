@@ -1,6 +1,8 @@
 # POSIX helpers shared by the installer, its read-only checks and the installed CLI.
 has() { command -v "$1" >/dev/null 2>&1; }
 
+ubuntu_release() ( [ -r "$1" ] && . "$1" && [ "${ID:-}" = ubuntu ]; )
+
 rpm_manager() (
     for tool in dnf yum microdnf; do
         if "$tool" --version >/dev/null 2>&1; then printf '%s\n' "$tool"; return 0; fi
@@ -31,6 +33,13 @@ as_root() {
 }
 
 apt_ready() { has apt-get && apt-get --version >/dev/null 2>&1; }
+
+# Package names come from the installer's fixed lists and cannot contain commas.
+apt_archive_group() (
+    state=$1; shift
+    IFS=,
+    printf '%s/apt-archives/%s\n' "$state" "$*"
+)
 
 # Both the checklist and the installation use these distribution-signed sources.
 china_sources() (
@@ -184,6 +193,64 @@ KEYS
             [ "$found" = 0 ] || return 0
         done
     done
+    return 1
+)
+
+can_generate_sshd_key() (
+    case $1 in
+        /etc/ssh/ssh_host_rsa_key|/etc/ssh/ssh_host_ecdsa_key|/etc/ssh/ssh_host_ed25519_key)
+            [ ! -e "$1" ] && [ ! -L "$1" ] ;;
+        *) return 1 ;;
+    esac
+)
+
+check_sshd_config() (
+    scratch=$1; system=$2; priv=$3
+    daemon=$(command -v sshd) || return 1
+    set -- "$daemon"
+    if [ -n "$priv" ] && "${priv% }" -n true </dev/null >/dev/null 2>&1; then
+        set -- "${priv% }" -n "$daemon"
+    fi
+    if reason=$(LC_ALL=C "$@" -t 2>&1 >/dev/null); then return 0; fi
+    case $reason in *'no hostkeys available -- exiting.'*)
+        # ssh-keygen -A only creates missing default identities. A temporary -h
+        # key alone would also make a configuration with unusable custom keys pass.
+        generates=0; listed=0
+        if effective=$(LC_ALL=C "$@" -G 2>/dev/null); then
+            while IFS= read -r line; do
+                case $line in 'hostkey '*) can_generate_sshd_key "${line#hostkey }" && generates=1 ;; esac
+            done <<CONFIG
+$effective
+CONFIG
+        else
+            # Older sshd reports each explicitly configured unusable key on stderr.
+            while IFS= read -r line; do
+                case $line in *'load host key: '*)
+                    listed=1; path=${line#*load host key: }; can_generate_sshd_key "${path%"$(printf '\r')"}" && generates=1 ;;
+                esac
+            done <<DIAGNOSTICS
+$reason
+DIAGNOSTICS
+            if [ "$listed" = 0 ]; then
+                for path in /etc/ssh/ssh_host_rsa_key /etc/ssh/ssh_host_ecdsa_key /etc/ssh/ssh_host_ed25519_key; do
+                    can_generate_sshd_key "$path" && generates=1
+                done
+            fi
+        fi
+        if [ "$generates" = 0 ]; then
+            printf '%s\n' "$reason" '请修复 sshd_config 中的 HostKey 路径或权限，或恢复发行版默认的 HostKey 配置。'
+            return 1
+        fi
+        [ -n "$scratch" ] && [ -f "$scratch/pairing-check" ] || return 0
+        if reason=$(LC_ALL=C "$@" -t -h "$scratch/pairing-check" 2>&1 >/dev/null); then return 0; fi ;;
+    esac
+    # prepare_sshd creates this directory before starting the Linux service.
+    last=${reason##*'
+'}
+    case "$system/${last%"$(printf '\r')"}" in
+        'Linux/Missing privilege separation directory: /run/sshd'|'Linux/Missing privilege separation directory: /var/run/sshd') return 0 ;;
+    esac
+    printf '%s\n' "${reason:-sshd 配置检查失败}"
     return 1
 )
 

@@ -1,5 +1,6 @@
 """Find and verify an installed Chromium browser on a remote Mac or Linux host."""
 
+import grp
 import os
 from pathlib import Path
 import pwd
@@ -33,6 +34,18 @@ def candidates():
 
 def executable():
     return next(candidates(), None)
+
+
+def stable_chromium_snap(metadata, architecture):
+    if metadata.get("name") != "chromium":
+        return False
+    track = metadata.get("default-track") or "latest"
+    for revision in metadata.get("channel-map", []):
+        channel = revision["channel"]
+        if (channel.get("track") == track and channel.get("risk") == "stable"
+                and channel.get("architecture") in (architecture, "all") and revision.get("download", {}).get("url")):
+            return True
+    return False
 
 
 def root_browser_account(create):
@@ -76,8 +89,14 @@ def check_install_account():
         try:
             pwd.getpwnam(ROOT_BROWSER_USER)
         except KeyError:
-            return
+            try:
+                grp.getgrnam(ROOT_BROWSER_USER)
+            except KeyError:
+                return False
+            raise ValueError(f"已有名为 {ROOT_BROWSER_USER} 的组，无法为新浏览器账号创建同名专用组。") from None
         root_browser_account(False)
+        return True
+    return False
 
 
 def check_for_install():
@@ -92,14 +111,24 @@ def check_for_install():
                 raise ValueError("缺少可用于浏览器试启动的普通账号，请准备 termlo-browser 系统账号。") from None
             with tempfile.TemporaryDirectory(prefix="termlo-browser-check-", dir="/tmp") as home:
                 os.chown(home, account.pw_uid, account.pw_gid)
-                return render_candidates(candidates(), account_prefix(account, home))
+                return render_candidates(candidates(), account_prefix(account, home, probe=True))
+        account = root_browser_account(False)
+        return render_candidates(candidates(), account_prefix(account, account.pw_dir, probe=True))
     return check()
 
 
-def account_prefix(account, home):
-    return ["runuser", "-u", account.pw_name, "--", "env", "-i", "HOME=" + home,
-            "USER=" + account.pw_name, "LOGNAME=" + account.pw_name,
-            "PATH=/usr/local/bin:/usr/bin:/bin:/snap/bin"]
+def account_prefix(account, home, *, probe=False):
+    if account.pw_uid == 0 or account.pw_gid == 0:
+        raise ValueError("浏览器试启动需要非 root 的账号和组。")
+    environment = ["env", "-i", "HOME=" + home, "USER=" + account.pw_name, "LOGNAME=" + account.pw_name,
+                   "PATH=/usr/local/bin:/usr/bin:/bin:/snap/bin"]
+    if probe and not shutil.which("runuser"):
+        # The checklist can render as the unprivileged account before installing runuser.
+        drop_privileges = ("import os, sys\nname, uid, gid = sys.argv[1:4]\nos.initgroups(name, int(gid))\n"
+                           "os.setgid(int(gid))\nos.setuid(int(uid))\nos.execvp(sys.argv[4], sys.argv[4:])")
+        return [sys.executable, "-IS", "-c", drop_privileges, account.pw_name, str(account.pw_uid),
+                str(account.pw_gid), *environment]
+    return ["runuser", "-u", account.pw_name, "--", *environment]
 
 
 def check(path=None, *, prepare_root=False):

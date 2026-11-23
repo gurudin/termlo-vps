@@ -140,6 +140,29 @@ class UninstallTests(unittest.TestCase):
         self.assertEqual((project / "code").read_text(), "keep")
         self.assertEqual(custom.read_text(), "keep")
 
+    def test_receipt_round_trip_for_an_agent_installed_in_a_linked_version_directory(self):
+        target = sync_agent.installed_path()
+        target.parent.parent.mkdir(parents=True)
+        mounted = self.home / "shared volume"
+        mounted.mkdir()
+        target.parent.symlink_to(mounted)
+
+        def install():
+            target.write_bytes(b"owned agent")
+            return target
+
+        with patch.object(sync_agent, "install", side_effect=install):
+            self.receipt.install_agent()
+        restored = uninstall.Receipt(self.folder)
+        self.assertIn(str(target.resolve()), restored.data["agents"])
+        with patch.dict(os.environ, MUTAGEN_DATA_DIRECTORY=str(self.home / "different sync directory")):
+            uninstall.remove_agents(restored)
+        self.assertEqual(target.read_bytes(), b"owned agent")
+        uninstall.remove_agents(restored)
+        self.assertFalse(target.exists())
+        self.assertTrue(mounted.is_dir())
+        self.assertTrue(target.parent.is_symlink())
+
     def test_claude_native_updates_and_account_data(self):
         launcher = self.cli.with_name("claude")
         versions = self.home / "data/claude/versions"

@@ -342,6 +342,157 @@ esac''')
         self.assertFalse((self.home / "config/termlo/install.lock").exists())
         self.assertFalse((self.home / ".ssh").exists())
 
+    @unittest.skipIf(os.getuid() == 0, "the root account can write read-only directories")
+    def test_readonly_agent_directory_is_required_to_be_writable_only_for_repair(self):
+        folder = self.home / ".mutagen/agents/0.18.1"
+        folder.chmod(0o555)
+        self.addCleanup(folder.chmod, 0o755)
+        agent = folder / "mutagen-agent"
+        before = agent.read_bytes()
+        first = self.run_installer("--sync-only")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn("已就绪", first.stderr)
+        self.assertEqual(agent.read_bytes(), before)
+        keys = self.home / ".ssh/authorized_keys"
+        saved = keys.read_bytes()
+        command(agent, "echo old")
+        second = self.run_installer("--sync-only")
+        self.assert_checklist(second)
+        self.assertIn("能写入 " + str(folder), second.stderr)
+        self.assertEqual(keys.read_bytes(), saved)
+
+    def test_stopped_daemon_rejects_its_invalid_configuration_during_preflight(self):
+        self.env.pop("SSH_CONNECTION")
+        tools = self.home / "bin"
+        command(tools / "ssh-keyscan", "exit 1")
+        command(tools / "sudo", 'if [ "$1" = -n ]; then shift; fi; if [ "$1" = true ]; then exit 0; fi; exec "$@"')
+        command(tools / "sshd", 'echo "sshd_config line 3: Badly formatted port number." >&2; exit 255')
+        result = self.run_installer("--sync-only", "--host", "dev.example")
+        self.assert_checklist(result)
+        self.assertIn("[未通过] SSH 服务配置", result.stderr)
+        self.assertIn("sshd_config line 3", result.stderr)
+        self.assertIn("sshd -t", result.stderr)
+        self.assertFalse((self.home / "config/termlo/install.lock").exists())
+
+    def test_only_the_standard_missing_sshd_runtime_directory_can_be_prepared(self):
+        self.env.pop("SSH_CONNECTION")
+        tools = self.home / "bin"
+        command(tools / "ssh-keyscan", "exit 1")
+        command(tools / "sudo", 'shift; if [ "$1" = true ]; then exit 0; fi; exec "$@"')
+        command(tools / "sshd", 'printf "Missing privilege separation directory: %s\\r\\n" "$RUNTIME" >&2; exit 255')
+        for runtime in ("/run/sshd", "/var/run/sshd", "/run/sshd-custom"):
+            with self.subTest(runtime=runtime):
+                self.env["RUNTIME"] = runtime
+                result = self.run_installer("--check", "--sync-only", "--host", "dev.example")
+                self.assert_checklist(result)
+                self.assertEqual(result.returncode == 0, runtime != "/run/sshd-custom", result.stderr)
+                self.assertFalse((self.home / "config/termlo/install.lock").exists())
+
+    def test_missing_custom_host_key_is_not_replaced_by_the_preflight_key(self):
+        daemon = shutil.which("sshd", path=os.defpath + ":/usr/sbin")
+        if not daemon:
+            self.skipTest("requires OpenSSH server")
+        config = self.home / "sshd_config"
+        config.write_text(f'HostKey "{self.home}/missing-custom-key"\n')
+        self.env.update(DAEMON=daemon, SERVER_CONFIG=str(config))
+        self.env.pop("SSH_CONNECTION")
+        tools = self.home / "bin"
+        command(tools / "ssh-keyscan", "exit 1")
+        command(tools / "sudo", 'shift; if [ "$1" = true ]; then exit 0; fi; exec "$@"')
+        command(tools / "sshd", 'exec "$DAEMON" -f "$SERVER_CONFIG" "$@"')
+        result = self.run_installer("--sync-only", "--host", "dev.example")
+        self.assert_checklist(result)
+        self.assertIn("[未通过] SSH 服务配置", result.stderr)
+        self.assertIn("missing-custom-key", result.stderr)
+        self.assertFalse((self.home / "config/termlo/install.lock").exists())
+
+    def test_apt_must_be_able_to_install_the_missing_base_tools_together(self):
+        tools = self.home / "bin"
+        for name in ("git", "tmux"):
+            (tools / name).unlink()
+        (tools / "mkdir").symlink_to(shutil.which("mkdir"))
+        command(tools / "dpkg", '[ "$1" = --version ]')
+        command(tools / "sudo", '[ "$1 $2" = "-n true" ]')
+        command(tools / "apt-get", '''
+[ "$1" != --version ] || exit 0
+for arg do case $arg in Dir::Cache::archives=*) archives=${arg#*=} ;; esac; done
+case " $* " in
+    *" update "*) exit 0 ;;
+    *" --download-only "*)
+        n=0
+        for arg do case $arg in git|tmux) n=$((n+1)); echo deb > "$archives/${arg}_1_amd64.deb" ;; esac; done
+        [ "$n" -eq 1 ] ;;
+    *) echo unexpected > "$HOME/mutation"; exit 1 ;;
+esac''')
+        result = self.run_installer("--without-claude")
+        self.assert_checklist(result)
+        for label in ("Git", "tmux"):
+            self.assertIn("[通过] " + label + " 安装来源", result.stderr)
+        self.assertIn("[未通过] APT 组合安装", result.stderr)
+        self.assertIn("apt-get -s --no-remove", result.stderr)
+        self.assertFalse((self.home / "mutation").exists())
+        self.assertFalse((self.home / "config/termlo/install.lock").exists())
+
+    def test_missing_scp_can_be_installed_during_an_active_ssh_session(self):
+        tools = self.home / "bin"
+        (tools / "scp").unlink()
+        for name in ("mkdir", "chmod", "env"):
+            (tools / name).symlink_to(shutil.which(name))
+        command(tools / "dpkg", '[ "$1" = --version ]')
+        command(tools / "sudo", 'if [ "$1" = -n ]; then shift; fi; exec "$@"')
+        # sudo may also run the shell builtin true in the permission check.
+        (tools / "true").symlink_to(shutil.which("true"))
+        command(tools / "apt-get", '''
+[ "$1" != --version ] || exit 0
+for arg do case $arg in Dir::Cache::archives=*) archives=${arg#*=} ;; esac; done
+case " $* " in
+    *" update "*) exit 0 ;;
+    *" --download-only "*) [ -z "${archives:-}" ] || echo deb > "$archives/openssh-client_1.deb" ;;
+    *" --no-download "*) if [ -f "$HOME/provide-scp" ]; then echo "#!/bin/sh" > "$HOME/bin/scp"; chmod +x "$HOME/bin/scp"; fi ;;
+    *) exit 1 ;;
+esac''')
+        check = self.run_installer("--check", "--sync-only")
+        self.assertEqual(check.returncode, 0, check.stderr)
+        self.assertIn("[通过] SSH 服务及主机密钥", check.stderr)
+        self.assertFalse((self.home / "config/termlo/install.lock").exists())
+        incomplete = self.run_installer("--sync-only")
+        self.assertNotEqual(incomplete.returncode, 0)
+        self.assertIn("仍找不到 scp", incomplete.stderr)
+        self.assertEqual(incomplete.stdout, "")
+        (self.home / "provide-scp").touch()
+        complete = self.run_installer("--sync-only")
+        self.assertEqual(complete.returncode, 0, complete.stderr)
+        self.assertTrue(complete.stdout.startswith("termlo://connect/"))
+
+    def test_hung_local_tool_does_not_hide_the_rest_of_the_checklist(self):
+        override = self.home / ".local/bin/tmux"
+        override.parent.mkdir(parents=True)
+        command(override, 'exec "' + shutil.which("sleep") + '" 60')
+        result = self.run_installer("--without-claude")
+        self.assert_checklist(result)
+        self.assertIn("[未通过] tmux  优先执行的", result.stderr)
+        self.assertIn('mv -i "$HOME/.local/bin/tmux"', result.stderr)
+        self.assertIn("[通过] ADB", result.stderr)
+        self.assertFalse((self.home / "config/termlo/install.lock").exists())
+        override.rename(override.with_name("tmux.disabled"))
+        retry = self.run_installer("--without-claude")
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+
+    def test_link_to_a_broken_private_tool_blocks_before_installing_the_system_package(self):
+        original = self.home / "old-tmux"
+        command(original, "exit 13")
+        link = self.home / ".local/bin/tmux"
+        link.parent.mkdir(parents=True)
+        link.symlink_to(original)
+        blocked = self.run_installer("--without-claude")
+        self.assert_checklist(blocked)
+        self.assertIn("[未通过] tmux  优先执行的", blocked.stderr)
+        self.assertIn('mv -i "$HOME/.local/bin/tmux"', blocked.stderr)
+        self.assertFalse((self.home / "config/termlo/install.lock").exists())
+        link.rename(link.with_name("tmux.disabled"))
+        recovered = self.run_installer("--without-claude")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+
     def test_browser_falls_back_to_a_working_candidate_after_render_failure(self):
         bad = self.home / "bin/chromium"
         good = self.home / "bin/google-chrome"

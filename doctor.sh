@@ -66,10 +66,39 @@ doctor_component() {
     fi
 }
 
+doctor_base_tool() {
+    label=$1; package=$2; shift 2
+    selected=$(command -v "$package" || :)
+    if [ -n "$selected" ] && { [ "$system" != Darwin ] || [ "$selected" != /usr/bin/git ] || /usr/bin/xcode-select -p >/dev/null 2>&1; }; then
+        if [ -n "$py" ] && [ -n "$payload" ]; then
+            probe=$("$py" -IB -c 'import sys; sys.path.insert(0, sys.argv[1])
+from termlo import base_tool_state
+print(base_tool_state(sys.argv[2:]))' "$payload" "$@" 2>/dev/null) || probe=unknown
+        elif has timeout; then
+            if timeout 10 "$@" </dev/null >/dev/null 2>&1; then probe=ready; else probe=unknown; fi
+        else
+            doctor_block "$label  已找到命令，暂时无法验证" '请按清单补齐 Python 或安装包解压工具，再运行同一条命令。'
+            return
+        fi
+        if [ "$probe" = ready ]; then doctor_pass "$label  可用"; return; fi
+        case $selected in
+            "$HOME/.local/bin/$package"|"$HOME/.npm-global/bin/$package")
+                if [ "$probe" != repair ]; then
+                    relative=${selected#"$HOME/"}
+                    doctor_block "$label  优先执行的 $selected 无法使用" "请修复该命令。若要使用系统软件包，可先运行 mv -i \"\$HOME/$relative\" \"\$HOME/$relative.disabled\" 后重试。"
+                    return
+                fi ;;
+        esac
+    fi
+    missing_base="${missing_base:+$missing_base }$package"
+    if [ "$package" = adb ]; then doctor_component "$label" adb android-tools android-tools '--cask android-platform-tools'
+    else doctor_component "$label" "$package" "$package" "$package" "$package"; fi
+}
+
 apt_packages_available() (
     [ -n "$scratch" ] && has mkdir && has cat || return 1
+    group=$(apt_archive_group "$scratch" "$@") || return 1
     if [ ! -f "$scratch/apt.conf" ]; then
-        mkdir -p "$scratch/apt-archives/partial" || return 1
         cat > "$scratch/apt.conf" <<'APT' || return 1
 #clear APT::Update::Pre-Invoke;
 #clear APT::Update::Post-Invoke;
@@ -95,6 +124,8 @@ APT
     fi
     for route in $routes; do
         lists=$scratch/apt-$route
+        archives=$group/$route
+        mkdir -p "$archives/partial" || return 1
         if [ ! -d "$lists" ]; then
             mkdir -p "$lists/partial" || return 1
             if [ "$route" = cn ]; then
@@ -108,11 +139,12 @@ APT
         set +f
         for package do
             found=0
-            for deb in "$scratch/apt-archives/${package}_"*.deb; do
+            for deb in "$archives/${package}_"*.deb; do
                 if [ -s "$deb" ]; then found=1; break; fi
             done
             [ "$found" = 1 ] || continue 2
         done
+        : > "$archives/verified" || return 1
         if [ "$route" != "${routes%% *}" ]; then printf '%s\n' "$route" > "$scratch/preferred" || return 1; fi
         return 0
     done
@@ -124,7 +156,7 @@ doctor_apt_get() {
         set -- -o "Dir::Etc::sourcelist=$lists/sources.list" -o Dir::Etc::sourceparts=- "$@"
     fi
     apt-get -c "$scratch/apt.conf" -o "Dir::State::lists=$lists" \
-        -o "Dir::Cache::archives=$scratch/apt-archives" -o "Dir::Log=$lists" \
+        -o "Dir::Cache::archives=$archives" -o "Dir::Log=$lists" \
         -o "Dir::State::extended_states=$lists/extended_states" "$@" >/dev/null 2>&1
 }
 
@@ -163,6 +195,7 @@ package_available() (
 )
 
 check_agent() (
+    case $mutagen in /*) ;; *) echo '请将 MUTAGEN_DATA_DIRECTORY 设置为绝对路径，或取消此变量以使用当前账号的默认目录。'; return 1 ;; esac
     agent=$agent_dir/mutagen-agent
     if [ -f "$agent" ] && [ -x "$agent" ]; then
         if [ -z "$py" ] || [ -z "$payload" ]; then
@@ -174,6 +207,10 @@ from sync_agent import correct_version
 sys.exit(not correct_version(Path(sys.argv[2])))' "$payload" "$agent" 2>/dev/null; then
             printf 'Mutagen 同步代理  %s 已就绪\n' "$version"; return 0
         fi
+    fi
+    if ! writable_directory "$agent_dir"; then
+        printf '请让当前账号能写入 %s，或将 MUTAGEN_DATA_DIRECTORY 指向当前账号可写的绝对路径。\n' "$agent_dir"
+        return 1
     fi
     case $system in Linux) os=linux ;; Darwin) os=darwin ;; *) echo '请使用支持的 Linux 或 macOS 设备。'; return 1 ;; esac
     case $machine in x86_64) arch=amd64 ;; arm64|aarch64) arch=arm64 ;; *) echo '请选择支持的 64 位处理器。'; return 1 ;; esac
@@ -233,10 +270,10 @@ except (OSError, ValueError) as error: sys.exit(str(error))' "$payload" 2>&1); t
         doctor_pass "远程浏览器  已渲染测试页  $browser"; return
     else status=$?; fi
     if [ "$status" = 4 ]; then
-        doctor_block "远程浏览器运行账号  $browser" '运行 getent passwd termlo-browser 核对账号。请管理员处理同名账号冲突，保留原有数据，再重试。'; return
+        doctor_block "远程浏览器运行账号  $browser" '运行 getent passwd termlo-browser 和 getent group termlo-browser 核对账号和组。请管理员处理同名冲突后再重试。'; return
     fi
     ubuntu=0
-    if [ "$family" = apt ] && [ -r "$release" ] && ( . "$release"; [ "${ID:-}" = ubuntu ] ); then ubuntu=1; fi
+    if [ "$family" = apt ] && ubuntu_release "$release"; then ubuntu=1; fi
     if [ "$ubuntu" = 1 ]; then fix="${priv}apt-get update && ${priv}apt-get install -y snapd && ${priv}systemctl enable --now snapd.socket && ${priv}snap install chromium"
     else fix=$(package_hint 'chromium chromium-sandbox' chromium chromium '--cask google-chrome'); fi
     if [ "$status" != 3 ]; then
@@ -259,12 +296,19 @@ except (OSError, ValueError) as error: sys.exit(str(error))' "$payload" 2>&1); t
         doctor_component '远程浏览器 Chromium' 'chromium chromium-sandbox' chromium chromium '--cask google-chrome'
     elif [ ! -d /run/systemd/system ] && [ ! -S /run/snapd.socket ]; then
         doctor_block '远程浏览器安装来源  当前 Ubuntu 无法启动 Snap' '请在有 systemd 的设备上启用 snapd.socket，或安装可实际启动的 Google Chrome 后重试。'
-    elif [ -n "$scratch" ] && { snap --version >/dev/null 2>&1 || package_available snapd; } &&
-            curl -qfsSL --connect-timeout 5 --max-time 16 -H 'Snap-Device-Series: 16' \
-            'https://api.snapcraft.io/v2/snaps/info/chromium' -o "$scratch/chromium.json" &&
-            "$py" -IB -c 'import json,sys; sys.exit(not json.load(open(sys.argv[1])).get("channel-map"))' "$scratch/chromium.json" 2>/dev/null; then
-        packages_needed=1; doctor_pass '远程浏览器安装来源  Snap 提供 Chromium'
-    else doctor_block '远程浏览器安装来源  无法验证 Chromium 的 Snap 安装包' "$fix"; fi
+    else
+        case $machine in x86_64) snap_arch=amd64 ;; aarch64|arm64) snap_arch=arm64 ;; *) snap_arch=$machine ;; esac
+        if [ -n "$scratch" ] && { snap --version >/dev/null 2>&1 || package_available snapd; } &&
+                curl -qfsSL --proto '=https' --proto-redir '=https' --connect-timeout 5 --max-time 16 \
+                -H 'Snap-Device-Series: 16' -H "Snap-Device-Architecture: $snap_arch" \
+                'https://api.snapcraft.io/v2/snaps/info/chromium' -o "$scratch/chromium.json" &&
+                "$py" -IB -c 'import json,sys; sys.path.insert(0, sys.argv[1])
+from native_browser import stable_chromium_snap
+with open(sys.argv[2]) as response: sys.exit(not stable_chromium_snap(json.load(response), sys.argv[3]))' \
+                    "$payload" "$scratch/chromium.json" "$snap_arch" 2>/dev/null; then
+            packages_needed=1; doctor_pass "远程浏览器安装来源  Snap 提供 $snap_arch 的 Chromium 稳定版"
+        else doctor_block "远程浏览器安装来源  无法验证 $snap_arch 的 Chromium 稳定版" "$fix"; fi
+    fi
 }
 
 doctor_arguments() {
@@ -289,7 +333,7 @@ termlo_doctor() (
     payload=$1; manifest=$2; release=$3; scratch=$4; interactive=$5; shift 5
     system=$(uname -s 2>/dev/null) || system=未知
     machine=$(uname -m 2>/dev/null) || machine=未知
-    passed=0; failed=0; packages_needed=0; admin_needed=0; full=1; check_only=0
+    passed=0; failed=0; packages_needed=0; admin_needed=0; check_stopped_sshd=0; full=1; check_only=0
     port=22; key=''; claude='安装时可选择'; manager=''; manager_ok=0; brew_formula=0; brew_cask=0
     printf '\nTermlo 安装前体检清单\n' >&2
     doctor_arguments "$@"
@@ -318,7 +362,7 @@ termlo_doctor() (
     version=${manifest%%'
 '*}
     agent_dir=$mutagen/agents/$version
-    for path in "$config" "$HOME/.ssh" "$HOME/.local/bin" "$agent_dir"; do
+    for path in "$config" "$HOME/.ssh" "$HOME/.local/bin"; do
         if writable_directory "$path"; then doctor_pass "安装目录  可写入 $path"
         else doctor_block "安装目录  无法写入 $path" "请确保 $path 是当前 SSH 用户可读写的目录，或恢复其上级目录的写权限。"; fi
     done
@@ -395,7 +439,8 @@ except (OSError, ValueError, RuntimeError) as error: sys.exit(str(error))' "$pay
     missing=''
     for tool in ssh scp ssh-keygen ssh-keyscan; do has "$tool" || missing="$missing $tool"; done
     if [ -z "$missing" ]; then doctor_pass 'SSH 客户端工具  ssh、scp、ssh-keygen、ssh-keyscan'
-    elif [ -n "${SSH_CONNECTION:-}$key" ]; then doctor_block "SSH 客户端工具  缺少${missing}，无法核验现有连接" "$ssh_fix"
+    elif [ -n "${SSH_CONNECTION:-}$key" ] && { ! has ssh-keygen || ! has ssh-keyscan; }; then
+        doctor_block "SSH 客户端工具  缺少${missing}，无法核验现有连接" "$ssh_fix"
     else doctor_component "SSH 客户端工具（缺少${missing}）" openssh-client openssh-clients 'openssh-client-default openssh-keygen' openssh; fi
     if has ssh-keygen; then
         if [ -n "$scratch" ] && ssh-keygen -q -t ed25519 -N '' -C '' -f "$scratch/pairing-check" </dev/null >/dev/null 2>&1 &&
@@ -434,6 +479,7 @@ ENDPOINT
             doctor_component 'OpenSSH 服务端' openssh-server openssh-server openssh-server openssh
         elif [ "$system" = Darwin ] && [ ! -x /usr/sbin/systemsetup ]; then
             doctor_block 'SSH 服务配置工具不可用' '请在系统设置的「通用 → 共享 → 远程登录」中允许当前用户登录。'
+        elif has sshd; then check_stopped_sshd=1
         else doctor_pass 'SSH 服务配置工具  可在安装阶段生成主机密钥并启动服务'; fi
     fi
     if [ -n "$key" ]; then
@@ -449,16 +495,26 @@ ENDPOINT
     if [ -d "$agent_target" ]; then
         doctor_block "Mutagen 同步代理  可执行文件路径被目录占用" "请将 $agent_target 目录移到其他位置，再重新运行安装命令。"
     elif agent=$(check_agent); then doctor_pass "$agent"
-    else doctor_block 'Mutagen 同步代理  无法验证安装来源或版本' "$agent"; fi
+    else doctor_block 'Mutagen 同步代理  无法复用或安装' "$agent"; fi
 
     if [ "$full" = 1 ]; then
-        if { [ "$system" != Darwin ] || [ "$(command -v git || :)" != /usr/bin/git ] || /usr/bin/xcode-select -p >/dev/null 2>&1; } && git --version >/dev/null 2>&1; then doctor_pass 'Git  可用'; else doctor_component Git git git git git; fi
-        if tmux -V >/dev/null 2>&1; then doctor_pass 'tmux  可用'; else doctor_component tmux tmux tmux tmux tmux; fi
-        if adb version >/dev/null 2>&1; then doctor_pass 'ADB  可用'; else doctor_component ADB adb android-tools android-tools '--cask android-platform-tools'; fi
+        missing_base=''; previous_failures=$failed
+        doctor_base_tool Git git git --version
+        doctor_base_tool tmux tmux tmux -V
+        doctor_base_tool ADB adb adb version
+        # The installer passes these missing tools to APT in one transaction.
+        case "$family/$missing_base" in apt/*' '*)
+            if [ "$previous_failures" = "$failed" ]; then
+                if package_available "$missing_base"; then doctor_pass "APT 组合安装  $missing_base 可一同安装"
+                else doctor_block "APT 组合安装  $missing_base 无法一同安装" "运行 apt-get -s --no-remove --reinstall install $missing_base 查看依赖错误，再用 apt-cache policy $missing_base 核对候选版本及软件源。修复后重试。"; fi
+            fi ;;
+        esac
         doctor_browser
         if [ "$system" = Linux ] && [ "$uid" = 0 ]; then
-            if has useradd && has runuser; then doctor_pass '浏览器运行账号工具  可用'
-            else doctor_component '浏览器运行账号工具' 'passwd util-linux' 'shadow-utils util-linux' 'shadow cmd:runuser' ''; fi
+            if has useradd || id -u termlo-browser >/dev/null 2>&1; then doctor_pass '浏览器账号  可创建或复用'
+            else doctor_component '浏览器账号创建工具 useradd' passwd shadow-utils shadow ''; fi
+            if has runuser; then doctor_pass '浏览器运行工具 runuser  可用'
+            else doctor_component '浏览器运行工具 runuser' util-linux util-linux 'cmd:runuser' ''; fi
         fi
     fi
     if [ "$family" = brew ] && [ "$manager_ok" = 0 ]; then
@@ -486,6 +542,11 @@ ENDPOINT
     elif "${priv% }" -n true </dev/null >/dev/null 2>&1; then doctor_pass '安装权限  已验证系统安装权限'
     elif [ "$check_only" = 0 ] && [ "$failed" = 0 ] && ( : </dev/tty ) 2>/dev/null && as_root true </dev/tty; then doctor_pass '安装权限  管理员已授权'
     else doctor_block '安装权限  尚未取得系统安装权限' "请在交互式 SSH 终端运行 ${priv}true 完成管理员授权，或请管理员按清单补齐组件。"; fi
+    if [ "$check_stopped_sshd" = 1 ]; then
+        if reason=$(check_sshd_config "$scratch" "$system" "$priv"); then
+            doctor_pass 'SSH 服务配置  已检查，安装时生成缺少的主机密钥并启用服务'
+        else doctor_block "SSH 服务配置无法通过检查  $reason" "请按上方提示核对配置文件和行号，然后运行 ${priv}sshd -t 复查。"; fi
+    fi
     if [ "$full" = 1 ]; then printf '  Claude Code（选装）  %s\n' "$claude" >&2; fi
     if [ "$failed" -gt 0 ]; then
         if [ "$uid" != 0 ] && [ -z "$priv" ]; then printf '上方涉及系统软件的补齐命令请由管理员执行，之后回到当前 SSH 账号重试。\n' >&2; fi

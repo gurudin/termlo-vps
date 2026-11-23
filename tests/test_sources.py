@@ -109,12 +109,68 @@ esac''')
         self.assertEqual(self.log.read_text().splitlines()[-4:], ["system download", "cn index",
                                                                   "cn download", "cn install"])
 
+    def test_partial_downloads_from_different_routes_or_requests_cannot_verify_a_batch(self):
+        command(self.folder / "apt-get", '''
+route=system
+for arg do
+    case "$arg" in Dir::Etc::sourcelist=*) route=cn ;; Dir::Cache::archives=*) archives=${arg#*=} ;; esac
+done
+case " $* " in
+    *" update "*) exit 0 ;;
+    *" --download-only "*)
+        echo "$route download" >> "$LOG"
+        for arg do
+            case "$route/$arg/$FULL" in
+                system/git/*|cn/tmux/*|cn/git/yes)
+                    if [ -n "${archives:-}" ]; then echo package > "$archives/${arg}_1_arm64.deb"; fi ;;
+            esac
+        done ;;
+    *) echo "$route install" >> "$LOG" ;;
+esac''')
+        args = ["sh", "-ec", '. "$1"; . "$2"; release=$3; scratch=$4; '
+                'apt_packages_available git; apt_packages_available tmux; apt_packages_available git tmux',
+                "check", str(ROOT / "prerequisites.sh"), str(ROOT / "doctor.sh"),
+                str(self.release), str(self.folder)]
+        partial = subprocess.run(args, env=dict(self.env, FULL="no"), capture_output=True, text=True)
+        self.assertNotEqual(partial.returncode, 0, partial.stderr)
+        full = subprocess.run(args, env=dict(self.env, FULL="yes"), capture_output=True, text=True)
+        self.assertEqual(full.returncode, 0, full.stderr)
+
+        # A later component can change the global preference. Install the batch
+        # from its own confirmed source even when the system route is preferred.
+        (self.folder / "preferred").write_text("system\n")
+        install = subprocess.run(["bash", "-c", '. "$1"; install_packages "$2" global "$3" git tmux',
+                                  "install", self.script, str(self.release), str(self.folder)],
+                                 env=dict(self.env, FULL="yes"), capture_output=True, text=True)
+        self.assertEqual(install.returncode, 0, install.stderr)
+        self.assertEqual(self.log.read_text().splitlines()[-2:], ["cn download", "cn install"])
+
     def test_overseas_and_unknown_use_system_first_and_leave_dpkg_errors_visible(self):
         self.assertNotEqual(self.apt("global", FAIL="system install").returncode, 0)
         self.assertEqual(self.log.read_text().splitlines(), ["system index", "system download", "system install"])
         self.log.write_text("")
         self.assertEqual(self.apt("auto").returncode, 0)
         self.assertEqual(self.log.read_text().splitlines(), ["system download", "system install"])
+
+    def test_returning_to_the_mirror_after_a_system_update_refreshes_its_index(self):
+        command(self.folder / "apt-get", '''
+route=system
+for arg do case "$arg" in Dir::Etc::sourcelist=*) route=cn ;; esac; done
+case " $* " in
+    *" update "*) echo "$route update" >> "$LOG"
+        if [ "$route" = cn ]; then echo index > "$STATE/cn-index"; else rm -f "$STATE/cn-index"; fi ;;
+    *" --download-only "*)
+        if [ "$route" = cn ]; then test -s "$STATE/cn-index"
+        else case " $* " in *" git "*) exit 0 ;; *) exit 100 ;; esac; fi ;;
+    *) : ;;
+esac''')
+        result = subprocess.run(["bash", "-ec", '. "$1"; install_packages "$2" cn "$3" tmux; '
+                                 'echo system > "$3/preferred"; install_packages "$2" global "$3" git; '
+                                 'echo cn > "$3/preferred"; install_packages "$2" cn "$3" adb',
+                                 "install", self.script, str(self.release), str(self.folder)],
+                                env=dict(self.env, STATE=str(self.folder)), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.log.read_text().splitlines(), ["cn update", "system update", "cn update"])
 
     def test_missing_or_unsupported_os_release_uses_configured_sources(self):
         self.release.unlink()

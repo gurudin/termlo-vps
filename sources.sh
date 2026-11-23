@@ -50,18 +50,24 @@ detect_network() {
 }
 
 install_packages() {
-    local release=$1 region=$2 state=$3 route preferred=system arch
+    local release=$1 region=$2 state=$3 route preferred=system arch group
     shift 3
     local options=() routes=(system cn)
     [[ $region != cn ]] || preferred=cn
     if [[ -s $state/preferred ]]; then read -r preferred < "$state/preferred"; fi
+    group=$(apt_archive_group "$state" "$@")
+    if [[ ! -f $group/$preferred/verified ]]; then
+        for route in system cn; do
+            if [[ -f $group/$route/verified ]]; then preferred=$route; break; fi
+        done
+    fi
     if [[ $preferred == cn ]]; then routes=(cn system); fi
 
     for route in "${routes[@]}"; do
         options=(-o Acquire::http::Timeout=8 -o Acquire::https::Timeout=8 -o DPkg::Lock::Timeout=60)
         # Only use the preflight archives when the same privileged user fetched them.
-        if (( EUID == 0 )) && [[ -d $state/apt-archives/partial ]]; then
-            options+=(-o "Dir::Cache::archives=$state/apt-archives")
+        if (( EUID == 0 )) && [[ -f $group/$route/verified ]]; then
+            options+=(-o "Dir::Cache::archives=$group/$route")
         fi
         if [[ $route == cn ]]; then
             arch=$(dpkg --print-architecture 2>/dev/null) || continue
@@ -73,6 +79,8 @@ install_packages() {
             echo "APT 使用系统已配置的软件源。" >&2
         fi
         if [[ ! -f $state/$route.ready ]]; then
+            # The system update may clean indexes outside its configured sources.
+            if [[ $route == system ]]; then rm -f -- "$state/cn.ready"; fi
             if ! as_root apt-get update "${options[@]}" -o APT::Update::Error-Mode=any; then
                 echo "APT 索引获取失败，尝试其他可用源。" >&2
                 continue

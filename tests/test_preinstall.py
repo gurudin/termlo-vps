@@ -1,4 +1,5 @@
 import hashlib
+from contextlib import nullcontext
 import io
 import os
 from pathlib import Path
@@ -81,6 +82,34 @@ class DownloadTrustTests(unittest.TestCase):
             install.assert_not_called()
 
 
+class ToolPathTests(unittest.TestCase):
+    def test_a_link_to_the_package_binary_can_be_repaired_but_a_separate_file_cannot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            system = home / "system-bin"
+            user = home / ".local/bin"
+            system.mkdir()
+            user.mkdir(parents=True)
+            binary = system / "tmux"
+            binary.write_text("#!/bin/sh\nexit 1\n")
+            binary.chmod(0o755)
+            link = user / "tmux"
+            link.symlink_to(binary)
+            with patch.dict(os.environ, HOME=tmp, PATH=f"{user}:{system}"), patch.object(os, "defpath", str(system)):
+                self.assertEqual(termlo.base_tool_state(["tmux", "-V"]), "repair")
+                link.unlink()
+                os.link(binary, link)
+                self.assertEqual(termlo.base_tool_state(["tmux", "-V"]), "override")
+
+    def test_mac_cli_uses_the_same_homebrew_precedence_on_repeated_entry(self):
+        with patch.dict(os.environ, HOME="/test-home", PATH="/usr/bin:/bin"), patch.object(sys, "platform", "darwin"):
+            expected = ["/test-home/.local/bin", "/test-home/.npm-global/bin", "/opt/homebrew/bin",
+                        "/usr/local/bin", "/usr/bin", "/bin"]
+            for _ in range(2):
+                termlo.add_tool_paths()
+                self.assertEqual(os.get_exec_path(), expected)
+
+
 class BrowserInstallTests(unittest.TestCase):
     def test_remote_mac_installs_native_browser_and_platform_tools_with_homebrew(self):
         packages = Mock()
@@ -95,16 +124,53 @@ class BrowserInstallTests(unittest.TestCase):
     def test_ubuntu_uses_installed_snap_service_for_a_missing_browser(self):
         with tempfile.TemporaryDirectory() as tmp:
             release = Path(tmp) / "os-release"
-            release.write_text('ID="ubuntu"\n')
+            release.write_text('ID="ubuntu" # distribution\n')
             packages = termlo.SystemPackages("global", tmp, termlo.uninstall.Receipt(Path(tmp)))
+            original_run = subprocess.run
+            def run_command(args, **kwargs):
+                if args[0] == "/bin/sh":
+                    return original_run(args, **kwargs)
+                return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
             with patch.object(sys, "platform", "linux"), patch.object(termlo, "OS_RELEASE", release), \
                  patch.object(native_browser, "executable", return_value=None), patch.object(native_browser, "check"), \
                  patch.object(packages, "install") as install_packages, \
                  patch("shutil.which", return_value="/usr/bin/snap"), patch.object(os, "getuid", return_value=501), \
-                 patch("subprocess.run", return_value=subprocess.CompletedProcess([], 1)) as run:
+                 patch("subprocess.run", side_effect=run_command) as run:
                 termlo.ensure_browser(packages)
         install_packages.assert_not_called()
         self.assertIn(call(["sudo", "snap", "install", "chromium"], check=True), run.call_args_list)
+
+    def test_ubuntu_repairs_unusable_snap_cli_and_checks_the_stable_architecture(self):
+        packages = Mock()
+        with patch.object(sys, "platform", "linux"), patch.object(os, "geteuid", return_value=501), \
+             patch.object(termlo, "shell_helper", return_value=subprocess.CompletedProcess([], 0)), \
+             patch.object(native_browser, "executable", return_value=None), patch.object(native_browser, "check"), \
+             patch.object(termlo, "tool_works", side_effect=[False, True, False, False]):
+            termlo.ensure_browser(packages)
+            with self.assertRaisesRegex(ValueError, "snap --version"):
+                termlo.ensure_browser(packages)
+        self.assertEqual(packages.install.call_args_list, [call(["snapd"]), call(["snapd"])])
+        packages.install_chromium_snap.assert_called_once()
+        metadata = {"name": "chromium", "channel-map": []}
+        for arch, risk in (("amd64", "stable"), ("arm64", "beta")):
+            metadata["channel-map"].append({"channel": {"architecture": arch, "risk": risk, "track": "latest"},
+                                            "download": {"url": "https://example.org/chromium.snap"}})
+        self.assertTrue(native_browser.stable_chromium_snap(metadata, "amd64"))
+        self.assertFalse(native_browser.stable_chromium_snap(metadata, "arm64"))
+
+    def test_existing_browser_account_needs_no_useradd_and_group_collision_is_reported(self):
+        account = Mock(pw_uid=101, pw_gid=101, pw_dir="/home/termlo-browser", pw_shell="/bin/false")
+        packages = Mock()
+        packages.receipt.observe_browser_user.return_value = nullcontext()
+        with patch.object(sys, "platform", "linux"), patch.object(os, "geteuid", return_value=0), \
+             patch("pwd.getpwnam", return_value=account), patch("shutil.which", side_effect=lambda name: name if name == "runuser" else None), \
+             patch.object(native_browser, "executable", return_value="/usr/bin/chromium"), patch.object(native_browser, "check"):
+            termlo.ensure_browser(packages)
+        packages.install.assert_not_called()
+        with patch.object(sys, "platform", "linux"), patch.object(os, "geteuid", return_value=0), \
+             patch("pwd.getpwnam", side_effect=KeyError), patch("grp.getgrnam", return_value=object()):
+            with self.assertRaisesRegex(ValueError, "同名专用组"):
+                native_browser.check_install_account()
 
     def test_root_browser_probe_uses_only_the_dedicated_unprivileged_account(self):
         process = Mock(returncode=0)

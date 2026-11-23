@@ -158,10 +158,8 @@ class Receipt:
                     or any(not isinstance(name, str) or name not in PACKAGES[family] for name in names)):
                 raise ValueError(f"请核对安装记录 packages.{family} 中的软件包列表。")
         for filename, checksum in saved["agents"].items():
-            path = Path(filename)
-            if (not path.is_absolute() or "\x00" in filename or path.name != "mutagen-agent"
-                    or not VERSION_NAME.fullmatch(path.parent.name) or path.parent.parent.name != "agents"
-                    or not isinstance(checksum, str) or not SHA256.fullmatch(checksum)):
+            recorded_agent_path(filename)
+            if not isinstance(checksum, str) or not SHA256.fullmatch(checksum):
                 raise ValueError("请核对安装记录 agents 中的代理路径和 SHA-256。")
         if "claude" in saved:
             entry = saved["claude"]
@@ -188,6 +186,7 @@ class Receipt:
                 raise ValueError("请核对安装记录 browserUser 中的主目录标识。")
 
     def save(self):
+        self.validate(self.data)
         with tempfile.NamedTemporaryFile(mode="w", dir=self.path.parent, delete=False, encoding="utf-8") as stream:
             stage = Path(stream.name)
             try:
@@ -316,18 +315,36 @@ def remove_if_original(path, checksum):
     path.unlink()
 
 
+def recorded_agent_path(filename):
+    # The receipt stores a resolved file. A linked version directory can have
+    # another physical name, including in receipts produced by older installers.
+    path = Path(filename)
+    if not path.is_absolute() or ".." in path.parts or "\x00" in filename or path.name != "mutagen-agent":
+        raise ValueError("请核对安装记录 agents 中的代理路径。")
+    return path
+
+
 def remove_agents(receipt):
     for saved, checksum in receipt.data["agents"].items():
-        path = Path(saved)
-        if (not path.is_absolute() or path.name != "mutagen-agent" or not VERSION_NAME.fullmatch(path.parent.name)
-                or path.parent.parent.name != "agents"):
-            raise ValueError("同步代理的安装记录异常。")
+        path = recorded_agent_path(saved)
         if path.parent.resolve() != path.parent:
             note(f"已保留路径发生变化的同步代理：{path}")
             continue
+        standard = path.parent.parent.name == "agents" and VERSION_NAME.fullmatch(path.parent.name)
+        if not standard:
+            # Only remove a nonstandard physical file if the configured Mutagen
+            # directory still points there. The linked directory belongs to its owner.
+            try:
+                selected = sync_agent.installed_path().parent.resolve()
+            except (OSError, ValueError, RuntimeError):
+                selected = None
+            if selected != path.parent:
+                note(f"当前同步目录无法确认此代理的位置，已保留：{path}")
+                continue
         remove_if_original(path, checksum)
-        rmdir_if_empty(path.parent)
-        rmdir_if_empty(path.parent.parent)
+        if standard:
+            rmdir_if_empty(path.parent)
+            rmdir_if_empty(path.parent.parent)
 
 
 def remove_claude(entry):
