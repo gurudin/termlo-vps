@@ -21,16 +21,34 @@ RECEIPT = "termlo-paired-v2"
 
 
 def check_authorization_directories():
-    # OpenSSH's default StrictModes checks the directories leading to
-    # authorized_keys, even when the file itself has mode 0600.
-    unsafe = []
-    home = Path.home()
-    for path, label in ((home, '"$HOME"'), (home / ".ssh", '"$HOME/.ssh"')):
-        if path.is_dir() and path.stat().st_mode & 0o022:
-            unsafe.append(label)
-    if unsafe:
-        targets = " ".join(unsafe)
-        raise ValueError(f"{targets} 允许组或其他用户写入。请用该账号收紧目录权限后重试：\n             chmod go-w {targets}")
+    try:
+        home = Path.home().resolve()
+        ssh = home / ".ssh"
+        paths = {home: '"$HOME"', ssh.resolve(): '"$HOME/.ssh"'}
+        # StrictModes walks the real path of authorized_keys, stopping at the
+        # account home (or at the root for a link outside the account home).
+        for parent in (ssh / "authorized_keys").resolve().parents:
+            paths.setdefault(parent, shlex.quote(str(parent)))
+            if parent == home:
+                break
+    except (OSError, RuntimeError) as error:
+        raise ValueError("请检查 ~/.ssh 和 authorized_keys 的链接是否循环、当前账号能否访问链接目标。") from error
+
+    problems = []
+    for path, label in paths.items():
+        if not path.is_dir():
+            continue
+        info = path.stat()
+        if info.st_uid not in (0, os.getuid()):
+            problems.append(f"{label} 属于其他账号。请让管理员核对所有者，将 SSH 授权文件保存在该账号的专用目录。")
+        elif info.st_mode & 0o022:
+            if path != home and home not in path.parents:
+                problems.append(f"SSH 授权文件经过可被其他用户写入的外部目录 {label}。请将授权文件迁入账号的专用目录并更新链接。")
+            else:
+                command = "chmod" if info.st_uid == os.getuid() else "sudo chmod"
+                problems.append(f"{label} 允许组或其他用户写入。请收紧目录权限后重试：\n             {command} go-w {label}")
+    if problems:
+        raise ValueError("\n           ".join(problems))
 
 
 def account_file(path, *, replace):

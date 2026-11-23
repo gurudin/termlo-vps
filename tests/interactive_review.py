@@ -11,8 +11,10 @@ import pty
 import re
 import select
 import shlex
+import shutil
 import signal
 import subprocess
+import tarfile
 import tempfile
 import time
 
@@ -24,8 +26,8 @@ SSH = ["ssh", "-F", "/dev/null", "-o", "BatchMode=yes", "-o", "IdentityAgent=non
        "-o", "ClearAllForwardings=yes"]
 
 
-def output(args):
-    result = subprocess.run(list(map(str, args)), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=180)
+def output(args, env=None):
+    result = subprocess.run(list(map(str, args)), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=180, env=env)
     if result.returncode:
         raise RuntimeError(f"{args[0]} exited {result.returncode}: {result.stderr[-650:]}")
     return result.stdout.strip()
@@ -85,6 +87,50 @@ def checked_code(result):
     return json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))), transcript
 
 
+def sync_both_directions(work, fixed, connection, device, target):
+    system = platform.system().lower()
+    arch = {"x86_64":"amd64", "arm64":"arm64", "aarch64":"arm64"}[platform.machine()]
+    platform_name = f"{system}_{arch}"
+    version, *assets = (ROOT / "mutagen-releases.txt").read_text().splitlines()
+    _, _, digest = next(line.split() for line in assets if line.startswith(platform_name + " "))
+    archive = work / "client.tgz"
+    url = f"https://github.com/mutagen-io/mutagen/releases/download/v{version}/mutagen_{platform_name}_v{version}.tar.gz"
+    output(["curl", "-fsSL", "--retry", "2", "-o", archive, url])
+    assert hashlib.sha256(archive.read_bytes()).hexdigest() == digest
+    with tarfile.open(archive) as release:
+        for name in ("mutagen", "mutagen-agents.tar.gz"):
+            with release.extractfile(name) as src, (work/name).open("wb") as dst:
+                shutil.copyfileobj(src, dst)
+    binary = work / "mutagen"
+    binary.chmod(0o700)
+    tools = work / "tools"
+    tools.mkdir()
+    for command in ("ssh", "scp"):
+        tool = tools / command
+        args = [shutil.which(command), *fixed[1:], "-i", str(device)]
+        tool.write_text("#!/bin/sh\nexec " + shlex.join(args) + ' "$@"\n')
+        tool.chmod(0o700)
+    env = dict(os.environ, MUTAGEN_DATA_DIRECTORY=str(work/"sync"), MUTAGEN_SSH_PATH=str(tools), MUTAGEN_SSH_CONNECT_TIMEOUT="8")
+    local = work / "工程 A"
+    local.mkdir()
+    item = local / "本机.py"
+    item.write_text("from the client")
+    remote = output([*connection, "mktemp -d /tmp/termlo-review.XXXXXXXX"])
+    assert re.fullmatch(r"/(private/)?tmp/termlo-review\.[A-Za-z0-9]+", remote)
+    remote_item = shlex.quote(remote + "/本机.py")
+    try:
+        output([binary, "sync", "create", "--name=termlo-review", local, target + ":" + remote], env)
+        output([binary, "sync", "flush", "termlo-review"], env)
+        assert output([*connection, "cat " + remote_item]) == "from the client"
+        output([*connection, "printf 'from the server' > " + remote_item])
+        output([binary, "sync", "flush", "termlo-review"], env)
+        assert item.read_text() == "from the server"
+        output([binary, "sync", "terminate", "termlo-review"], env)
+        print("The paired endpoint synced a Chinese-named file in both directions", flush=True)
+    finally:
+        output([binary, "daemon", "stop"], env)
+
+
 def verify():
     os.umask(0o077)
     assert os.environ.get("GITHUB_ACTIONS") == "true", "A disposable GitHub runner is required"
@@ -96,7 +142,7 @@ def verify():
     assert ipaddress.ip_address(host).is_private and not ipaddress.ip_address(host).is_loopback
     assert PUBLIC in (ROOT / "README.md").read_text()
     expected = hashlib.sha256((ROOT / "install.sh").read_bytes()).hexdigest()
-    with tempfile.TemporaryDirectory() as directory:
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="tl-") as directory:
         work = pathlib.Path(directory).resolve()
         os.chdir(work)
         if mac:
@@ -184,6 +230,26 @@ def verify():
         version = output([*connection, 'export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"; claude --version'])
         assert "Claude" in version
         print("Official Claude Code verified by running " + version, flush=True)
+        sync_both_directions(work, fixed, connection, device, target)
+        # Run only on these disposable machines. An unserviceable real SSH
+        # prerequisite must stop a reinstall before it changes the old device.
+        output([*connection, """set -eu
+marker="$HOME/.local/bin/ssh-keyscan"
+test ! -e "$marker"
+temp=$(mktemp -d)
+trap 'rm -f "$marker"; rm -rf "$temp"' EXIT
+cp "$HOME/.ssh/authorized_keys" "$temp/before"
+printf '#!/bin/sh\\nexit 1\\n' > "$marker"
+chmod 700 "$marker"
+if "$HOME/.local/bin/termlo" install --sync-only > "$temp/code" 2>"$temp/issues"; then exit 1; fi
+grep -q '体检未通过' "$temp/issues"
+test ! -s "$temp/code"
+cmp "$temp/before" "$HOME/.ssh/authorized_keys" """])
+        assert output([*connection, "printf retained"]) == "retained"
+        again, _ = checked_code(wizard(launch))
+        assert all(again[k] == payload[k] for k in ("host","port","user","hostKey"))
+        assert output([*connection, "printf retained"]) == "retained"
+        print("A failed reinstall and a successful rerun both preserved the working paired device", flush=True)
 
 
 if __name__ == "__main__":

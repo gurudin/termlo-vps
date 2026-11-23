@@ -286,6 +286,48 @@ esac''')
         self.assertTrue(keys.read_bytes().startswith(b"# existing keys\n"))
         self.assertIn(b" termlo-pair:", keys.read_bytes())
 
+    def test_writable_ssh_directories_stop_first_install_before_authorization(self):
+        ssh = self.home / ".ssh"
+        ssh.mkdir(mode=0o700)
+        keys = ssh / "authorized_keys"
+        keys.write_bytes(b"# an existing authorization\n")
+        for folder, mode, label in ((ssh, 0o777, '"$HOME/.ssh"'), (self.home, 0o770, '"$HOME"')):
+            original = folder.stat().st_mode & 0o777
+            with self.subTest(folder=label):
+                folder.chmod(mode)
+                result = self.run_installer("--sync-only")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("[未通过] SSH 授权目录权限", result.stderr)
+                self.assertIn("chmod go-w " + label, result.stderr)
+                self.assertFalse(result.stdout)
+                self.assertEqual(keys.read_bytes(), b"# an existing authorization\n")
+                self.assertFalse((self.home / ".local/bin/termlo").exists())
+                self.assertEqual(folder.stat().st_mode & 0o777, mode)
+                folder.chmod(original)
+        result = self.run_installer("--sync-only")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(result.stdout.startswith("termlo://connect/"))
+
+    def test_linked_authorization_file_checks_the_directories_sshd_will_read(self):
+        ssh = self.home / ".ssh"
+        ssh.mkdir(mode=0o700)
+        shared = self.home / "shared keys"
+        folder = shared / "account"
+        folder.mkdir(parents=True)
+        target = folder / "keys"
+        target.write_bytes(b"# existing\n")
+        (ssh / "authorized_keys").symlink_to(target)
+        shared.chmod(0o777)
+        result = self.run_installer("--sync-only")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("[未通过] SSH 授权目录权限", result.stderr)
+        self.assertFalse(result.stdout)
+        self.assertEqual(target.read_bytes(), b"# existing\n")
+        shared.chmod(0o755)
+        result = self.run_installer("--sync-only")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((ssh / "authorized_keys").is_symlink())
+
     def test_agent_version_requires_successful_exit(self):
         agent = self.home / ".mutagen/agents/0.18.1/mutagen-agent"
         command(agent, "echo 0.18.1; exit 1")
