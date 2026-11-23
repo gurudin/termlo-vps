@@ -12,8 +12,6 @@ jobs:
         os: [ubuntu-24.04, macos-15]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 23
-    env:
-      REVIEW_CANDIDATE: 'yes'
     steps:
       - uses: actions/checkout@v5
         with:
