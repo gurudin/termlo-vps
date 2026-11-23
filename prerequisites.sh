@@ -87,7 +87,7 @@ $metadata
 META
         printf '可从发行版软件源恢复。手动运行 (d=$(mktemp -d) && cd "$d" && curl -fLO %s && echo "%s  %s" | sha256sum -c - && %sdpkg -i %s)\n' "$url" "$sha" "${url##*/}" "$1" "${url##*/}"
     elif has python3 && python3 -B -c 'import apt' 2>/dev/null; then
-        printf '%s\n' "可用 python3-apt 自动恢复 apt-get，重新运行原安装命令即可。"
+        printf "%spython3 -c 'import apt; c=apt.Cache(); c.update(); c.open(); p=c[\"apt\"]; c._depcache.set_reinstall(p._pkg, True) if p.is_installed else p.mark_install(); c.commit()'\n" "$1"
     elif has pkcon; then printf '%spkcon --noninteractive install apt\n' "$1"
     else
         printf '从本机发行版、版本及架构对应的官方安装介质取出 apt 和所需依赖的 .deb，放入一个空目录。在该目录运行 %sdpkg -i ./*.deb && apt-get --version\n' "$1"

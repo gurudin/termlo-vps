@@ -56,7 +56,7 @@ def verify_archive(path, expected_digest, name):
         raise ValueError(f"{name} 校验失败，请重新下载官方安装包。")
 
 
-def install():
+def install(verified_archive=None):
     target = installed_path()
     if correct_version(target):
         return target
@@ -66,7 +66,7 @@ def install():
     with tempfile.TemporaryDirectory(dir=target.parent, prefix=".install-") as tmp:
         folder = Path(tmp)
         archive = folder / name
-        local = os.environ.get("TERMLO_MUTAGEN_ARCHIVE")
+        local = verified_archive or os.environ.get("TERMLO_MUTAGEN_ARCHIVE")
         if local:
             archive = Path(local)
         else:

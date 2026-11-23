@@ -1,7 +1,10 @@
-# Sourced with prerequisites.sh. Every check runs before installing system packages.
-doctor_row() { printf '  [%s] %s\n' "$1" "$2" >&2; }
-doctor_hint() { printf '           %s\n' "$1" >&2; }
-doctor_block() { doctor_row 需处理 "$1"; doctor_hint "$2"; blocked=1; }
+# Preflight only reads the host and uses disposable package metadata. Every failure
+# is recorded so a user can fix all blockers before running the same command again.
+doctor_pass() { printf '  [通过] %s\n' "$1" >&2; passed=$((passed + 1)); }
+doctor_block() {
+    printf '  [未通过] %s\n           补齐方法  %s\n' "$1" "$2" >&2
+    failed=$((failed + 1))
+}
 
 package_hint() {
     case $family in
@@ -9,232 +12,298 @@ package_hint() {
         rpm) printf '%s%s install -y %s' "$priv" "${manager:-dnf}" "$2" ;;
         apk) printf '%sapk add --no-cache %s' "$priv" "$3" ;;
         brew) printf 'brew install %s' "$4" ;;
-        *) printf '请让设备管理员安装 %s，然后重新运行安装器。' "$1" ;;
+        *) printf '请用系统软件管理器安装 %s，或使用 Debian/Ubuntu、RPM 系、Alpine 或 macOS。' "$1" ;;
     esac
 }
-doctor_package() {
-    doctor_row 自动安装 "$1"
-    doctor_hint "$(package_hint "$2" "$3" "$4" "$5")"
-    packages_needed=1
-}
+
 writable_directory() (
     dir=$1
     case $dir in /*) ;; *) return 1 ;; esac
-    while [ ! -e "$dir" ]; do dir=${dir%/*}; [ -n "$dir" ] || dir=/; done
+    while [ ! -e "$dir" ]; do
+        [ ! -L "$dir" ] || return 1
+        dir=${dir%/*}; [ -n "$dir" ] || dir=/
+    done
     [ -d "$dir" ] && [ -w "$dir" ] && [ -x "$dir" ]
 )
 
-# BusyBox systems can validate an offline release before even Bash or Python exists.
+# These are tools Termlo installs. A missing tool passes only if its delivery
+# route can be verified. Installer prerequisites themselves must already work.
+doctor_component() {
+    label=$1; shift
+    packages_needed=1
+    case $family in
+        apt) names=$1 ;; rpm) names=$2 ;; apk) names=$3 ;; brew) names=$4 ;; *) names=$1 ;;
+    esac
+    fix=$(package_hint "$@")
+    if [ "$manager_ok" = 1 ] && package_available "$names"; then
+        doctor_pass "$label 安装来源  已确认 $names 可用，安装时补齐"
+    else
+        doctor_block "$label 安装来源  无法确认 $names 可安装" "$fix"
+    fi
+}
+
+package_available() (
+    # Names and options come exclusively from doctor_component's fixed package lists.
+    set -f
+    set -- $1
+    case $family in
+        apt) apt-get -s --no-remove --no-install-recommends install "$@" >/dev/null 2>&1 ;;
+        apk) apk --no-cache --simulate add "$@" >/dev/null 2>&1 ;;
+        brew)
+            HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 "$@" >/dev/null 2>&1 ;;
+        rpm)
+            [ -n "$scratch" ] || return 1
+            for pkg do
+                if [ "$manager" = microdnf ]; then
+                    output=$(microdnf --setopt="cachedir=$scratch/rpm" repoquery "$pkg" 2>/dev/null) &&
+                        [ -n "$output" ] || return 1
+                elif ! "$manager" -q --setopt="cachedir=$scratch/rpm" --setopt="logdir=$scratch" \
+                        --setopt="persistdir=$scratch" list --available "$pkg" >/dev/null 2>&1; then
+                    # The installer enables EPEL on supported EL derivatives when base repos lack a tool.
+                    [ -r /etc/redhat-release ] && [ -r "$release" ] || return 1
+                    . "$release"
+                    major=${VERSION_ID%%.*}
+                    case $major in ''|*[!0-9]*) return 1 ;; esac
+                    "$manager" -q --setopt="cachedir=$scratch/rpm" --setopt="logdir=$scratch" \
+                        --setopt="persistdir=$scratch" list --available epel-release >/dev/null 2>&1 || return 1
+                    "$manager" -q --setopt="cachedir=$scratch/rpm" --setopt="logdir=$scratch" \
+                        --setopt="persistdir=$scratch" \
+                        --repofrompath="termlo-epel,https://dl.fedoraproject.org/pub/epel/$major/Everything/\$basearch/" \
+                        list --available "$pkg" >/dev/null 2>&1 || return 1
+                fi
+            done ;;
+        *) return 1 ;;
+    esac
+)
+
 check_agent() (
     version=${manifest%%'
 '*}
     agent=$mutagen/agents/$version/mutagen-agent
     if [ -x "$agent" ] && [ "$("$agent" version 2>/dev/null)" = "$version" ]; then
-        echo "Mutagen $version 同步代理已就绪"; return 0
+        printf 'Mutagen 同步代理  %s 已就绪\n' "$version"; return 0
     fi
-    case "$machine" in x86_64|amd64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) return 1 ;; esac
-    case "$system" in Darwin) os=darwin ;; Linux) os=linux ;; *) return 1 ;; esac
+    case $system in Linux) os=linux ;; Darwin) os=darwin ;; *) echo '请使用支持的 Linux 或 macOS 设备。'; return 1 ;; esac
+    case $machine in x86_64) arch=amd64 ;; arm64|aarch64) arch=arm64 ;; *) echo '请选择支持的 64 位处理器。'; return 1 ;; esac
     while read -r target asset digest; do
         [ "$target" = "${os}_$arch" ] || continue
         name=mutagen_${target}_v$version.tar.gz
         url=https://github.com/mutagen-io/mutagen/releases/download/v$version/$name
-        if [ -n "${TERMLO_MUTAGEN_ARCHIVE:-}" ]; then
-            if [ -r "$TERMLO_MUTAGEN_ARCHIVE" ]; then
-                if has sha256sum; then checksum=$(sha256sum < "$TERMLO_MUTAGEN_ARCHIVE")
-                elif has shasum; then checksum=$(shasum -a 256 < "$TERMLO_MUTAGEN_ARCHIVE")
-                else echo '需要 SHA-256 校验工具。请安装 coreutils 或使用系统 shasum。'; return 1; fi
-                if [ "${checksum%% *}" = "$digest" ]; then echo "Mutagen $version 同步代理（离线包 SHA-256 已核对）"; return 0; fi
-            fi
-            echo "离线包无法读取或校验失败。下载命令：curl -fL -o $name $url"; return 1
-        fi
-        api=https://api.github.com/repos/mutagen-io/mutagen/releases/assets/$asset
-        cmd="curl -fL --retry 2 -o $name $url"
-        for source in "$url" "$api"; do
-            if has curl; then
-                if curl -qfsIL --connect-timeout 5 --max-time 15 -H 'Accept: application/octet-stream' "$source" >/dev/null 2>&1; then
-                    echo "Mutagen $version 同步代理（官方下载地址可访问）"; return 0
-                else status=$?; fi
-                if [ "$os" = linux ] && [ -z "${CURL_CA_BUNDLE:-}${SSL_CERT_FILE:-}${SSL_CERT_DIR:-}" ]; then
-                    case $status in
-                        77) repair_ca=1 ;;
-                        60) if [ -n "$py" ] && "$py" -IB -c 'import ssl,sys; sys.exit(bool(ssl.create_default_context().get_ca_certs()))'; then repair_ca=1; fi ;;
-                    esac
+        file=${TERMLO_MUTAGEN_ARCHIVE:-$scratch/agent.tar.gz}
+        hint="请在可联网设备运行 curl -fL -o $name $url，把文件放到远端后设置 export TERMLO_MUTAGEN_ARCHIVE=\"\$PWD/$name\"。"
+        if [ -z "${TERMLO_MUTAGEN_ARCHIVE:-}" ]; then
+            [ -n "$scratch" ] || { echo "请修复临时目录。$hint"; return 1; }
+            api=https://api.github.com/repos/mutagen-io/mutagen/releases/assets/$asset
+            for source in "$url" "$api"; do
+                if curl -qfsSL --proto '=https' --proto-redir '=https' --connect-timeout 8 --max-time 180 \
+                        -H 'Accept: application/octet-stream' -o "$file" "$source" && archive_matches "$file" "$digest"; then
+                    printf 'Mutagen 安装包  官方 %s 的 SHA-256 已核对\n' "$version"; return 0
                 fi
-            elif has wget; then
-                if wget --spider -T 8 "$source" >/dev/null 2>&1; then echo "Mutagen $version 同步代理（官方下载地址可访问）"; return 0; fi
-            else echo "Mutagen $version 同步代理（安装 curl 后校验官方下载包）"; return 0; fi
-        done
-        if [ "${repair_ca:-0}" = 1 ]; then echo "Mutagen $version（需要先修复系统 ca-certificates）"; return 0; fi
-        echo "两个官方下载入口均不可达。在可联网设备运行 $cmd，复制到远端后设置 export TERMLO_MUTAGEN_ARCHIVE=\"\$PWD/$name\"。"; return 1
+            done
+        elif [ -f "$file" ] && [ -r "$file" ] && archive_matches "$file" "$digest"; then
+            printf 'Mutagen 安装包  离线包 %s 的 SHA-256 已核对\n' "$version"; return 0
+        fi
+        echo "下载或校验失败。$hint"; return 1
     done <<RELEASES
 $manifest
 RELEASES
-    return 1
+    echo '请使用包含当前系统与架构的 Termlo 发行版本。'; return 1
 )
 
+archive_matches() (
+    if has sha256sum; then actual=$(sha256sum < "$1") || return 1
+    elif has shasum; then actual=$(shasum -a 256 < "$1") || return 1
+    elif [ -n "$py" ]; then
+        "$py" -IB -c 'import sys; sys.path.insert(0, sys.argv[1]); from sync_agent import verify_archive
+from pathlib import Path
+verify_archive(Path(sys.argv[2]), sys.argv[3], "Mutagen")' "$payload" "$1" "$2" >/dev/null 2>&1; return
+    else return 1; fi
+    [ "${actual%% *}" = "$2" ]
+)
+
+doctor_browser() {
+    if [ -z "$payload" ]; then
+        doctor_block '远程浏览器  无法读取试启动程序' '先修复上方安装包解压问题，再运行同一条安装命令。'; return
+    fi
+    if [ -z "$py" ]; then
+        doctor_block '远程浏览器  缺少 Python，无法核验' "$(package_hint python3 python3.11 python3 python)"; return
+    fi
+    if browser=$("$py" -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import native_browser
+try: native_browser.check_install_account()
+except (OSError, ValueError) as error: print(error, file=sys.stderr); sys.exit(4)
+try:
+    if not native_browser.executable(): sys.exit(3)
+    print(native_browser.check_for_install())
+except (OSError, ValueError) as error: sys.exit(str(error))' "$payload" 2>&1); then
+        doctor_pass "远程浏览器  已渲染测试页  $browser"; return
+    else status=$?; fi
+    if [ "$status" = 4 ]; then
+        doctor_block "远程浏览器运行账号  $browser" '运行 getent passwd termlo-browser 核对账号。请管理员处理同名账号冲突，保留原有数据，再重试。'; return
+    fi
+    ubuntu=0
+    if [ "$family" = apt ] && [ -r "$release" ] && ( . "$release"; [ "${ID:-}" = ubuntu ] ); then ubuntu=1; fi
+    if [ "$ubuntu" = 1 ]; then fix="${priv}apt-get update && ${priv}apt-get install -y snapd && ${priv}systemctl enable --now snapd.socket && ${priv}snap install chromium"
+    else fix=$(package_hint 'chromium chromium-sandbox' chromium chromium '--cask google-chrome'); fi
+    if [ "$status" != 3 ]; then doctor_block "远程浏览器  $browser" "$fix；按上面的错误修复后重试。"; return; fi
+    if [ "$ubuntu" = 0 ]; then
+        doctor_component '远程浏览器 Chromium' 'chromium chromium-sandbox' chromium chromium '--cask google-chrome'
+    elif [ ! -d /run/systemd/system ] && [ ! -S /run/snapd.socket ]; then
+        doctor_block '远程浏览器安装来源  当前 Ubuntu 无法启动 Snap' '请在有 systemd 的设备上启用 snapd.socket，或安装可实际启动的 Google Chrome 后重试。'
+    elif [ -n "$scratch" ] && { snap --version >/dev/null 2>&1 || package_available snapd; } &&
+            curl -qfsSL --connect-timeout 5 --max-time 16 -H 'Snap-Device-Series: 16' \
+            'https://api.snapcraft.io/v2/snaps/info/chromium' -o "$scratch/chromium.json" &&
+            "$py" -IB -c 'import json,sys; sys.exit(not json.load(open(sys.argv[1])).get("channel-map"))' "$scratch/chromium.json" 2>/dev/null; then
+        packages_needed=1; doctor_pass '远程浏览器安装来源  Snap 提供 Chromium'
+    else doctor_block '远程浏览器安装来源  无法验证 Chromium 的 Snap 安装包' "$fix"; fi
+}
+
 termlo_doctor() (
-    payload=$1; manifest=$2; release=$3; shift 3
-    system=$(uname -s); machine=$(uname -m)
-    blocked=0; packages_needed=0; admin_needed=0; full=1; check_only=0
-    port=22; key=''; claude=选装
+    payload=$1; manifest=$2; release=$3; scratch=$4; shift 4
+    system=$(uname -s) || system=未知
+    machine=$(uname -m) || machine=未知
+    passed=0; failed=0; packages_needed=0; admin_needed=0; full=1; check_only=0
+    port=22; key=''; claude='安装时可选择'; manager=''; manager_ok=0
+    printf '\nTermlo 安装前体检清单\n' >&2
+    if [ "$#" -eq 0 ]; then
+        if ( : </dev/tty ) 2>/dev/null; then doctor_pass '交互终端  可用'
+        else doctor_block '安装向导需要交互终端' '请在设备控制台或交互式 SSH 会话中运行安装命令。'; fi
+    fi
     while [ "$#" -gt 0 ]; do
         case $1 in
             --check) check_only=1 ;;
             --sync-only) full=0 ;;
-            --with-claude) claude=已选择安装 ;;
-            --without-claude) claude=已跳过 ;;
+            --with-claude) claude='已选择安装' ;; --without-claude) claude='已选择跳过' ;;
             --port|--host-key|--host|--name)
-                [ "$#" -ge 2 ] || { echo "$1 缺少参数。" >&2; return 2; }
+                if [ "$#" -lt 2 ]; then doctor_block "安装参数 $1 缺少值" '补齐参数或运行原安装命令。'; break; fi
                 case $1 in --port) port=$2 ;; --host-key) key=$2 ;; esac
                 shift ;;
-            --port=*) port=${1#*=} ;; --host-key=*) key=${1#*=} ;;
-            --name=*|--host=*) ;;
-            *) printf '未知安装参数 %s。运行 sh install.sh --help 查看用法。\n' "$1" >&2; return 2 ;;
+            --port=*) port=${1#*=} ;; --host-key=*) key=${1#*=} ;; --name=*|--host=*) ;;
+            *) doctor_block "无法识别安装参数 $1" '移除该参数后重试。' ;;
         esac
         shift
     done
-    printf '\nTermlo 安装前体检\n' >&2
     case "$system/$machine" in Linux/x86_64|Linux/aarch64|Linux/arm64|Darwin/x86_64|Darwin/arm64)
-        doctor_row 就绪 "远程系统  $system $machine" ;;
-        *) doctor_block "远程系统  $system $machine" "请在 64 位 Intel/AMD 或 ARM 的 Linux 或 macOS 设备上运行。" ;;
+        doctor_pass "远程系统  $system $machine" ;;
+        *) doctor_block "远程系统  $system $machine" '请使用 64 位 Intel/AMD 或 ARM 的 Linux 或 macOS 设备。' ;;
     esac
-    uid=$(id -u); priv=''
+    uid=$(id -u) || uid=''
+    priv=''
     if [ "$uid" != 0 ]; then
         if has doas && ! has sudo; then priv='doas '; else priv='sudo '; fi
     fi
-    if { [ "$system" = Darwin ] && [ "$uid" = 0 ]; } ||
+    if [ -z "$uid" ] || { [ "$system" = Darwin ] && [ "$uid" = 0 ]; } ||
        { [ "$uid" = 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; }; then
-        doctor_block '安装账号  当前为提权后的账号' "请回到平时登录这台设备的 SSH 账号，直接运行安装命令。"
-    else doctor_row 就绪 "安装账号  UID $uid"; fi
+        doctor_block '安装账号  无法使用当前账号安装' '请使用平时登录这台设备的 SSH 账号，直接运行安装命令。'
+    else doctor_pass "安装账号  UID $uid"; fi
     config=${XDG_CONFIG_HOME:-$HOME/.config}/termlo
     mutagen=${MUTAGEN_DATA_DIRECTORY:-$HOME/.mutagen}
-    for path in "$config" "$HOME/.ssh" "$HOME/.local/bin" "$mutagen/agents"; do
-        writable_directory "$path" || doctor_block "安装目录  $path 无法写入" "请用拥有此目录的 SSH 账号安装，并检查目录权限：ls -ld \"$path\""
+    for path in "$config" "$HOME/.ssh" "$HOME/.local/bin" "$mutagen/agents/${manifest%%'
+'*}"; do
+        if writable_directory "$path"; then doctor_pass "安装目录  可写入 $path"
+        else doctor_block "安装目录  无法写入 $path" "请确保 $path 是当前 SSH 用户可读写的目录，或恢复其上级目录的写权限。"; fi
     done
     if [ -d "$HOME/.local/bin/termlo" ]; then
         doctor_block '命令安装位置已被目录占用' '请移动该目录后重试：mv "$HOME/.local/bin/termlo" "$HOME/.local/bin/termlo-directory"'
     fi
     if [ -e "$HOME/.ssh/authorized_keys" ] && ! { [ -f "$HOME/.ssh/authorized_keys" ] && [ -r "$HOME/.ssh/authorized_keys" ]; }; then
-        doctor_block 'SSH 授权文件无法读取' '请在此账号检查 ls -l "$HOME/.ssh/authorized_keys"'
-    fi
+        doctor_block 'SSH 授权文件无法读取' '请将 ~/.ssh/authorized_keys 恢复为当前账号可读的普通文件。'
+    else doctor_pass 'SSH 授权文件  可创建或读取'; fi
     if [ "$system" = Darwin ]; then family=brew; else family=$(linux_manager "$release") || family=unknown; fi
-    manager=''
-    if [ "$family" = rpm ]; then
-        for tool in dnf yum microdnf; do if has "$tool"; then manager=$tool; break; fi; done
-    fi
-    if has bash; then doctor_row 就绪 Bash; else doctor_package Bash bash bash bash bash; fi
-    py=$(find_python) || py=''
-    if [ -n "$py" ]; then doctor_row 就绪 "Python  $($py -V 2>&1)"
-    else doctor_package 'Python 3.8 或更高版本（含 TLS 支持）' python3 python3.11 python3 python; fi
-    if curl --version >/dev/null 2>&1; then doctor_row 就绪 'HTTPS 下载工具  curl'
-    else doctor_package 'HTTPS 下载工具  curl' 'curl ca-certificates' 'curl ca-certificates' 'curl ca-certificates' curl; fi
-    for tool in ssh scp ssh-keygen ssh-keyscan; do
-        if ! has "$tool"; then doctor_package "SSH 工具  缺少 $tool" openssh-client openssh-clients 'openssh-client-default openssh-keygen' openssh; break; fi
-    done
-    if [ -n "$key" ] && { [ ! -r "$key" ] || { has ssh-keygen && ! ssh-keygen -lf "$key" >/dev/null 2>&1; }; }; then
-        doctor_block '指定的 SSH 公钥不可读或无效' '移除 --host-key 参数重试，安装器会识别 SSH 服务实际使用的密钥。'
-    fi
-    case "$port" in ''|*[!0-9]*) valid_port=0 ;; *) valid_port=$port ;; esac
-    if ! { [ "$valid_port" -gt 0 ] && [ "$valid_port" -le 65535 ]; } 2>/dev/null; then
-        doctor_block 'SSH 端口超出范围' '请将 --port 设置为 1 到 65535 之间的对外端口。'
-    elif keys=$(scan_ssh "$port"); then
-        doctor_row 就绪 'SSH 服务及主机密钥  已从本机 SSH 端口取得公钥'
-        if [ -n "$key" ] && [ -r "$key" ]; then
-            read -r kind blob rest < "$key" || :
-            case "$keys " in *" $kind $blob "*|*" $kind $blob
-"*) ;; *) doctor_block '指定公钥与 SSH 服务不匹配' '请去掉 --host-key 后重试，让安装器读取实际提供连接的公钥。';; esac
-        fi
-    elif has ssh-keyscan && [ -n "${SSH_CONNECTION:-}" ]; then
-        read -r client client_port address internal_port <<ENDPOINT
-$SSH_CONNECTION
-ENDPOINT
-        doctor_block '当前 SSH 会话的本机端口未能出示主机公钥' "检查服务监听地址：ssh-keyscan -T 3 -p $internal_port $address"
+    if [ -n "$payload" ]; then doctor_pass '安装程序  可读取'
     else
-        doctor_row 自动准备 'SSH 服务及主机密钥  安装 OpenSSH、生成缺少的密钥并验证监听端口'
-        doctor_hint "${priv}ssh-keygen -A"
-        if [ "$system" = Linux ] && ! has sshd; then
-            doctor_package 'OpenSSH 服务端' openssh-server openssh-server openssh-server openssh
-        fi
-        admin_needed=1
-        if [ "$system" = Darwin ]; then doctor_hint '若 macOS 要求手动授权，打开「系统设置 → 通用 → 共享 → 远程登录」，允许此 SSH 账号登录。'; fi
-    fi
-
-    agent=$(check_agent) && agent_ok=1 || agent_ok=0
-    if [ "$agent_ok" = 0 ]; then doctor_block "Mutagen 同步代理  $agent" '修复网络或设置正确的离线包后重试。'
-    else
-        case $agent in
-            *已就绪*) doctor_row 就绪 "$agent" ;;
-            *ca-certificates*) doctor_package "$agent" ca-certificates ca-certificates ca-certificates ca-certificates ;;
-            *) doctor_row 自动安装 "$agent" ;;
-        esac
-    fi
-
-    if [ "$full" = 1 ]; then
-        if { [ "$system" != Darwin ] || [ "$(command -v git || :)" != /usr/bin/git ] || /usr/bin/xcode-select -p >/dev/null 2>&1; } && git --version >/dev/null 2>&1; then doctor_row 就绪 Git; else doctor_package Git git git git git; fi
-        if tmux -V >/dev/null 2>&1; then doctor_row 就绪 tmux; else doctor_package tmux tmux tmux tmux tmux; fi
-        if adb version >/dev/null 2>&1; then doctor_row 就绪 ADB; else doctor_package ADB adb android-tools android-tools '--cask android-platform-tools'; fi
-        if [ -z "$py" ]; then
-            doctor_row 待核验 '远程浏览器  Python 就绪后试启动，能渲染测试页就直接复用'
-            if [ "$family" = apt ] && [ -r "$release" ] && ( . "$release"; [ "${ID:-}" = ubuntu ] ); then
-                doctor_hint "缺少时安装 Chromium：${priv}snap install chromium"
-            else doctor_hint "缺少时运行：$(package_hint 'chromium chromium-sandbox' chromium chromium '--cask google-chrome')"; fi
-        elif browser=$("$py" -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import native_browser
-try: print(native_browser.check())
-except (OSError, ValueError) as error: sys.exit(str(error))' "$payload" 2>&1); then
-            doctor_row 就绪 "远程浏览器  已渲染测试页  $browser"
-        else
-            doctor_hint "$browser"
-            if [ "$family" = apt ] && [ -r "$release" ] && ( . "$release"; [ "${ID:-}" = ubuntu ] ); then
-                if [ ! -d /run/systemd/system ] && [ ! -S /run/snapd.socket ] && [ -n "$py" ] &&
-                   ! "$py" -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import native_browser; sys.exit(not native_browser.executable())' "$payload"; then
-                    doctor_block 'Ubuntu Chromium 需要 Snap 服务或已安装的原生浏览器' '在启用 systemd 的 Ubuntu 上运行 sudo systemctl enable --now snapd.socket，或安装可运行的 Google Chrome 后重试。'
-                else doctor_row 自动准备 '原生浏览器  安装并验证 Chromium'; doctor_hint "${priv}snap install chromium"; packages_needed=1; fi
-            else doctor_package '远程浏览器  安装或修复后实际渲染测试页' 'chromium chromium-sandbox' chromium chromium '--cask google-chrome'; fi
-        fi
-        if [ "$system" = Linux ] && [ "$uid" = 0 ]; then
-            for tool in useradd runuser; do
-                if ! has "$tool"; then doctor_package "浏览器运行账号工具  $tool" 'passwd util-linux' 'shadow-utils util-linux' 'shadow cmd:runuser' ''; break; fi
-            done
-        fi
-        if claude --version >/dev/null 2>&1; then doctor_row 就绪 'Claude Code'
-        else
-            doctor_row "$claude" 'Claude Code'
-            doctor_hint '基础环境装好后可运行 ~/.local/bin/termlo install --with-claude'
-        fi
+        if [ "$family" = brew ]; then unpack_fix='请恢复系统命令路径：export PATH="/usr/bin:/bin:/usr/sbin:/sbin:$PATH"'
+        else unpack_fix=$(package_hint 'coreutils tar gzip' 'coreutils tar gzip' 'busybox tar gzip' ''); fi
+        for tool in ${unpack_missing:-}; do doctor_block "安装包解压工具  缺少 $tool" "$unpack_fix"; done
+        if [ -n "${unpack_error:-}" ]; then doctor_block "$unpack_error" '检查临时目录可用空间和写权限，再运行原安装命令重新取得完整安装包。'; fi
     fi
     case $family in
         apt)
-            if apt_ready; then doctor_row 就绪 '系统包管理器  apt-get'
-            elif hint=$(apt_recovery_hint "$priv"); then doctor_row 自动修复 '系统包管理器  缺少 apt-get'; doctor_hint "$hint"; admin_needed=1
-            else doctor_block '系统包管理器  缺少 apt-get，未找到自动恢复工具' "$hint"; fi ;;
-        apk|rpm)
-            if [ "$family" = apk ] && has apk; then doctor_row 就绪 '系统包管理器  apk'
-            elif [ -n "$manager" ]; then doctor_row 就绪 "系统包管理器  $manager"
-            else doctor_block '缺少发行版软件管理器' "请管理员用同版本官方安装介质恢复软件包，RPM 系统可在含 dnf 及其依赖的目录运行 ${priv}rpm -Uvh --replacepkgs ./*.rpm。"; fi ;;
-        brew)
-            if has brew; then doctor_row 就绪 Homebrew
-            elif [ "$packages_needed" = 1 ]; then
-                doctor_row 自动安装 Homebrew
-                doctor_hint "安装器会运行官方程序，需要管理员授权。手动运行："
-                cat >&2 <<'BREW_COMMAND'
-           (f=$(mktemp) && trap 'rm -f "$f"' EXIT && curl -fsSL -o "$f" https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh && test -s "$f" && /bin/bash "$f")
-BREW_COMMAND
-                admin_needed=1
-            fi ;;
-        *) if [ "$packages_needed" = 1 ]; then doctor_block '无法识别系统包管理器' '请使用 Debian/Ubuntu、RPM 系、Alpine Linux 或 macOS 安装。'; fi ;;
+            if apt_ready; then manager_ok=1; doctor_pass '系统包管理器  apt-get'
+            else hint=$(apt_recovery_hint "$priv") || :; doctor_block '系统包管理器  apt-get 不可用' "$hint"; fi ;;
+        apk)
+            if apk --version >/dev/null 2>&1; then manager_ok=1; doctor_pass '系统包管理器  apk'
+            else doctor_block '系统包管理器  apk 不可用' '请从对应版本的 Alpine 安装介质恢复 apk-tools。'; fi ;;
+        rpm)
+            for tool in dnf yum microdnf; do
+                if "$tool" --version >/dev/null 2>&1; then manager=$tool; break; fi
+            done
+            if [ -n "$manager" ]; then manager_ok=1; doctor_pass "系统包管理器  $manager"
+            else doctor_block '系统包管理器  DNF/YUM 不可用' "请从同版本发行版取得管理器及其依赖的 RPM，在该目录运行 ${priv}rpm -Uvh --replacepkgs ./*.rpm。"; fi ;;
+        brew) if brew --version >/dev/null 2>&1; then manager_ok=1; doctor_pass '系统包管理器  Homebrew'; fi ;;
+        *) doctor_block '无法识别系统包管理器' '请使用 Debian/Ubuntu、RPM 系、Alpine Linux 或 macOS 安装。' ;;
     esac
-    if [ "$packages_needed" = 1 ] && [ "$family" != brew ]; then admin_needed=1; fi
-    if [ "$admin_needed" = 1 ] && [ "$uid" != 0 ]; then
-        if { has sudo && sudo -n true </dev/null; } 2>/dev/null || { has doas && doas -n true </dev/null; } 2>/dev/null; then
-            doctor_row 就绪 '系统组件安装权限'
-        elif { has sudo || has doas; } && ( : </dev/tty ) 2>/dev/null; then
-            doctor_row 需授权 '安装系统组件前将请求管理员授权'
-            if [ "$check_only" = 0 ] && [ "$blocked" = 0 ]; then
-                as_root true </dev/tty || doctor_block '未获得管理员权限' '请让管理员执行上面列出的系统组件命令，再用当前账号重试。'
-            fi
-        else doctor_block '当前账号无法安装系统组件' '请管理员执行上面列出的命令，或在交互式 SSH 终端运行 sudo -v 后重试。'; fi
+    if bash -c ':' >/dev/null 2>&1; then doctor_pass 'Bash  可执行'
+    else doctor_block 'Bash  缺少可执行的 Bash' "$(package_hint bash bash bash bash)"; fi
+    py=$(find_python) || py=''
+    if [ -n "$py" ]; then doctor_pass "Python  $("$py" -V 2>&1)，TLS 和压缩模块可用"
+    else doctor_block 'Python  需要 3.8 或更高版本且含 TLS 和压缩模块' "$(package_hint python3 python3.11 python3 python)"; fi
+    if curl --version >/dev/null 2>&1; then doctor_pass 'HTTPS 下载工具  curl'
+    else doctor_block 'HTTPS 下载工具  curl 不可用' "$(package_hint 'curl ca-certificates' 'curl ca-certificates' 'curl ca-certificates' curl)"; fi
+
+    if [ -n "$scratch" ] && [ -w "$scratch" ]; then doctor_pass '临时目录  可写入'
+    else doctor_block '临时目录无法写入' '请恢复 TMPDIR 的写权限及可用空间后重试。'; fi
+
+    ssh_fix=$(package_hint openssh-client openssh-clients 'openssh-client-default openssh-keygen' openssh)
+    missing=''
+    for tool in ssh scp ssh-keygen ssh-keyscan; do has "$tool" || missing="$missing $tool"; done
+    if [ -z "$missing" ]; then doctor_pass 'SSH 客户端工具  ssh、scp、ssh-keygen、ssh-keyscan'
+    elif [ -n "${SSH_CONNECTION:-}$key" ]; then doctor_block "SSH 客户端工具  缺少$missing，无法核验现有连接" "$ssh_fix"
+    else doctor_component "SSH 客户端工具（缺少$missing）" openssh-client openssh-clients 'openssh-client-default openssh-keygen' openssh; fi
+
+    case "$port" in ''|*[!0-9]*) valid_port=0 ;; *) valid_port=$port ;; esac
+    if ! { [ "$valid_port" -gt 0 ] && [ "$valid_port" -le 65535 ]; } 2>/dev/null; then
+        doctor_block 'SSH 端口超出范围' '请将 SSH 端口设置为 1 到 65535 之间的实际端口。'
+    elif keys=$(scan_ssh "$port"); then
+        doctor_pass 'SSH 服务及主机密钥  已从本机 SSH 端口取得公钥'
+    elif [ -n "${SSH_CONNECTION:-}" ]; then
+        read -r client client_port address internal_port <<ENDPOINT
+$SSH_CONNECTION
+ENDPOINT
+        doctor_block '当前 SSH 会话的本机端口未能出示主机公钥' "请确认 sshd 正在监听，修复后用 ssh-keyscan -T 3 -p $internal_port $address 验证。"
+    else
+        admin_needed=1
+        if [ "$system" = Linux ] && ! has sshd; then
+            doctor_component 'OpenSSH 服务端' openssh-server openssh-server openssh-server openssh
+        elif [ "$system" = Darwin ] && [ ! -x /usr/sbin/systemsetup ]; then
+            doctor_block 'SSH 服务配置工具不可用' '请在系统设置的「通用 → 共享 → 远程登录」中允许当前用户登录。'
+        else doctor_pass 'SSH 服务配置工具  可在安装阶段生成主机密钥并启动服务'; fi
     fi
-    if [ "$blocked" != 0 ]; then echo '体检未通过。处理以上项目后，重新运行安装命令。' >&2; return 1; fi
-    if [ "$check_only" = 1 ]; then echo '体检通过。正常运行安装命令即可补齐缺项。' >&2
-    else echo '体检通过。已安装且可用的组件会直接复用。' >&2; fi
+    if [ -n "$key" ]; then
+        if [ -r "$key" ] && ssh-keygen -lf "$key" >/dev/null 2>&1; then
+            read -r kind blob rest < "$key" || :
+            case "${keys:-} " in *" $kind $blob "*|*" $kind $blob
+"*) doctor_pass '指定 SSH 公钥  与服务一致' ;;
+                *) doctor_block '指定公钥与 SSH 服务不匹配' '去掉 --host-key 后重试，或提供该端口实际出示的公钥。' ;; esac
+        else doctor_block '指定的 SSH 公钥不可读或无效' '请修复公钥文件的路径和权限，或去掉 --host-key 让安装器自动识别。'; fi
+    fi
+    if agent=$(check_agent); then doctor_pass "$agent"
+    else doctor_block 'Mutagen 同步代理  无法验证安装来源或版本' "$agent"; fi
+
+    if [ "$full" = 1 ]; then
+        if { [ "$system" != Darwin ] || [ "$(command -v git || :)" != /usr/bin/git ] || /usr/bin/xcode-select -p >/dev/null 2>&1; } && git --version >/dev/null 2>&1; then doctor_pass 'Git  可用'; else doctor_component Git git git git git; fi
+        if tmux -V >/dev/null 2>&1; then doctor_pass 'tmux  可用'; else doctor_component tmux tmux tmux tmux tmux; fi
+        if adb version >/dev/null 2>&1; then doctor_pass 'ADB  可用'; else doctor_component ADB adb android-tools android-tools '--cask android-platform-tools'; fi
+        doctor_browser
+        if [ "$system" = Linux ] && [ "$uid" = 0 ]; then
+            if has useradd && has runuser; then doctor_pass '浏览器运行账号工具  可用'
+            else doctor_component '浏览器运行账号工具' 'passwd util-linux' 'shadow-utils util-linux' 'shadow cmd:runuser' ''; fi
+        fi
+    fi
+    if [ "$family" = brew ] && [ "$manager_ok" = 0 ]; then
+        if [ "$packages_needed" = 1 ] || [ -z "$py" ]; then
+            doctor_block '系统包管理器  缺少可用的 Homebrew' '运行 Homebrew 官方安装命令后按终端提示配置 PATH：/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
+        else doctor_pass '系统包管理器  当前组件均可复用，无需调用 Homebrew'; fi
+    fi
+    if [ "$packages_needed" = 1 ] && [ "$family" != brew ]; then admin_needed=1; fi
+    if [ "$admin_needed" = 0 ]; then doctor_pass '安装权限  本次无需系统提权'
+    elif [ "$uid" = 0 ]; then doctor_pass '安装权限  当前账号有系统安装权限'
+    elif "${priv% }" -n true </dev/null >/dev/null 2>&1; then doctor_pass '安装权限  已验证系统安装权限'
+    elif [ "$check_only" = 0 ] && [ "$failed" = 0 ] && ( : </dev/tty ) 2>/dev/null && as_root true </dev/tty; then doctor_pass '安装权限  管理员已授权'
+    else doctor_block '安装权限  尚未取得系统安装权限' "请在交互式 SSH 终端运行 ${priv}true 完成管理员授权，或请管理员按清单补齐组件。"; fi
+    if [ "$full" = 1 ]; then printf '  Claude Code（选装）  %s\n' "$claude" >&2; fi
+    if [ "$failed" -gt 0 ]; then
+        printf '体检未通过。%s 项通过，%s 项未通过。按上方方法补齐后重新运行安装命令。\n' "$passed" "$failed" >&2
+        return 1
+    fi
+    printf '体检通过。%s 项全部通过。\n' "$passed" >&2
 )

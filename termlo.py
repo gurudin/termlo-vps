@@ -338,8 +338,13 @@ def add_tool_paths():
         os.environ["PATH"] += ":/usr/sbin:/sbin"
 
 
-def install(args, terminal=None, checked=False):
+def install(args, terminal=None, checked=False, interactive=False):
     add_tool_paths()
+    with tempfile.TemporaryDirectory(prefix="termlo-install-") as state:
+        install_in_directory(args, terminal, checked, interactive, state)
+
+
+def install_in_directory(args, terminal, checked, interactive, state):
     if not checked:
         flags = []
         for name in ("host", "port", "host_key", "name"):
@@ -354,7 +359,7 @@ def install(args, terminal=None, checked=False):
             flags.append("--check")
         check_script = helper_source("python-runtime.sh", "prerequisites.sh", "doctor.sh") + b'\ntermlo_doctor "$@"\n'
         check_result = subprocess.run(["/bin/sh", "-s", "--", str(Path(__file__).parent),
-                                       helper_source("mutagen-releases.txt").decode(), str(OS_RELEASE), *flags],
+                                       helper_source("mutagen-releases.txt").decode(), str(OS_RELEASE), state, *flags],
                                       input=check_script)
         if check_result.returncode:
             raise ValueError("安装前体检未通过。")
@@ -364,7 +369,8 @@ def install(args, terminal=None, checked=False):
     optional_failure = None
     folder = config_dir()
     folder.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with (folder / "install.lock").open("a") as lock, tempfile.TemporaryDirectory(prefix="termlo-install-") as state:
+    terminal_context = open("/dev/tty", encoding="utf-8") if interactive else nullcontext(terminal)
+    with terminal_context as terminal, (folder / "install.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         channels = {"cn": "中国大陆，按系统选择可用软件源", "global": "海外，优先使用系统源和官方源",
                     "auto": "未识别到出口地区，优先使用系统源"}
@@ -383,7 +389,9 @@ def install(args, terminal=None, checked=False):
             packages.install(["curl"])
             subprocess.run(["curl", "--version"], stdout=subprocess.DEVNULL, check=True)
         note(f"正在准备 Mutagen {sync_agent.VERSION} 远端同步代理…")
-        agent = packages.with_https_repair(receipt.install_agent)
+        checked_archive = Path(state) / "agent.tar.gz"
+        agent = packages.with_https_repair(lambda: receipt.install_agent(checked_archive) if checked_archive.is_file()
+                                           else receipt.install_agent())
         note(f"双向同步的远端代理已就绪：{agent}")
         if not args.sync_only:
             ensure_base_tools(packages)
@@ -451,15 +459,8 @@ def main(checked=False):
 
 
 def dispatch(args, checked=False):
-    if args.command == "install" and len(sys.argv) == 2:
-        try:
-            terminal = open("/dev/tty", "r", encoding="utf-8")
-        except OSError:
-            raise ValueError("安装向导需要交互终端。请在设备控制台或交互式 SSH 会话中运行。") from None
-        with terminal:
-            install(args, terminal, checked)
-    elif args.command == "install":
-        install(args, checked=checked)
+    if args.command == "install":
+        install(args, checked=checked, interactive=len(sys.argv) == 2)
     elif args.command == "uninstall":
         add_tool_paths()
         uninstall.run(config_dir(), args.keep_tools)

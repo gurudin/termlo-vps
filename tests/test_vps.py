@@ -42,6 +42,7 @@ class InstallerTests(unittest.TestCase):
         self.events.touch()
         env = patch.dict(os.environ, {"HOME": str(self.home), "XDG_CONFIG_HOME": str(self.home / "config"),
                                       "PATH": str(self.bin), "EVENTS": str(self.events),
+                                      "PYTHONPATH": str(self.bin),
                                       "TERMLO_INSTALL_NETWORK": "global"}, clear=True)
         env.start()
         self.addCleanup(env.stop)
@@ -51,6 +52,7 @@ class InstallerTests(unittest.TestCase):
         for name in ("env", "bash", "id", "dirname", "ssh", "ssh-keygen", "scp", "mkdir", "mktemp", "rm", "cp", "cat", "chmod", "touch", "sh"):
             (self.bin / name).symlink_to(shutil.which(name, path="/usr/bin:/bin"))
         (self.bin / "python3").symlink_to(sys.executable)
+        (self.bin / "sitecustomize.py").write_text("import os, sys\nsys.platform = 'linux'\nos.geteuid = lambda: 501\n")
         command(self.bin / "uname", 'case "$1" in -s) echo Linux ;; -m) echo x86_64 ;; esac')
         command(self.bin / "apt-get", 'test "$1" = --version')
         command(self.bin / "ssh-keyscan", 'printf "host "; cat "$HOME/ssh host key.pub"')
@@ -204,7 +206,7 @@ SH''')
         self.assertTrue((self.bin / "tmux").exists())
         self.assertFalse((self.bin / "podman").exists())
         (self.home / "fail-browser").touch()
-        with self.assertRaisesRegex(ValueError, "渲染测试页"):
+        with self.assertRaisesRegex(ValueError, "安装前体检未通过"):
             self.wizard_install("\n\n")
 
     def test_china_claude_is_optional_and_uses_only_the_official_installer(self):

@@ -47,11 +47,30 @@ printf incomplete > partial-download
 export TERMLO_MUTAGEN_ARCHIVE="$work/partial-download"
 if install_termlo 2>first-install.log; then echo "Unexpected success with an incomplete agent archive"; exit 1; fi
 grep -q '校验失败' first-install.log || { cat first-install.log >&2; exit 1; }
+grep -q '^  \[未通过\] Mutagen' first-install.log
+grep -q '^  \[通过\] 远程系统' first-install.log
+grep -q '^体检未通过。' first-install.log
 test ! -s code
 test ! -e "$HOME/.local/bin/termlo"
 test ! -f "$HOME/.config/termlo/installed-components.json"
 if [ "$ID" != rocky ]; then test ! -e /etc/ssh/ssh_host_ed25519_key; fi
 unset TERMLO_MUTAGEN_ARCHIVE
+case "$ID" in
+    debian)
+        test ! -x /usr/bin/apt-get
+        grep -q '\[未通过\] 系统包管理器  apt-get' first-install.log
+        grep -q 'apt install -y --reinstall apt' first-install.log
+        apt update
+        apt install -y --reinstall apt
+        apt-get install -y --no-install-recommends curl ca-certificates python3 ;;
+    alpine)
+        grep -q '\[未通过\] Bash' first-install.log
+        grep -q '\[未通过\] Python' first-install.log
+        grep -q 'apk add --no-cache python3' first-install.log
+        test ! -x /bin/bash
+        test ! -x /usr/bin/python3
+        apk add --no-cache bash python3 curl ca-certificates ;;
+esac
 sh /src/install.sh --check --host 127.0.0.1
 if [ "$ID" != rocky ]; then test ! -e /etc/ssh/ssh_host_ed25519_key; fi
 install_termlo
@@ -110,6 +129,14 @@ if [ "$ID" = debian ]; then
     mv /usr/bin/apt "$work/original-apt"
     mv /usr/bin/apt-get "$work/recovered-apt-get"
     mv /usr/bin/tmux "$work/original-tmux"
+    if install_termlo 2>missing-apt.log; then echo "Unexpected install with missing APT"; exit 1; fi
+    grep -q '\[未通过\] 系统包管理器  apt-get' missing-apt.log
+    test ! -x /usr/bin/apt-get
+    test ! -x /usr/bin/tmux
+    # Apply the distribution-signed recovery route identified in the checklist,
+    # then rerun the installer and verify the already-paired SSH device.
+    . /src/prerequisites.sh
+    restore_apt
     install_termlo
     apt-get --version >/dev/null
     tmux -V

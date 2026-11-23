@@ -7,6 +7,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 
@@ -70,6 +71,37 @@ trap 'exit 1' HUP INT TERM
 """
 
 
+def check_install_account():
+    if sys.platform == "linux" and os.geteuid() == 0:
+        try:
+            pwd.getpwnam(ROOT_BROWSER_USER)
+        except KeyError:
+            return
+        root_browser_account(False)
+
+
+def check_for_install():
+    if sys.platform == "linux" and os.geteuid() == 0:
+        try:
+            pwd.getpwnam(ROOT_BROWSER_USER)
+        except KeyError:
+            # Test the installed browser without creating its permanent service account.
+            try:
+                account = pwd.getpwnam("nobody")
+            except KeyError:
+                raise ValueError("缺少可用于浏览器试启动的普通账号，请准备 termlo-browser 系统账号。") from None
+            with tempfile.TemporaryDirectory(prefix="termlo-browser-check-", dir="/tmp") as home:
+                os.chown(home, account.pw_uid, account.pw_gid)
+                return render_candidates(candidates(), account_prefix(account, home))
+    return check()
+
+
+def account_prefix(account, home):
+    return ["runuser", "-u", account.pw_name, "--", "env", "-i", "HOME=" + home,
+            "USER=" + account.pw_name, "LOGNAME=" + account.pw_name,
+            "PATH=/usr/local/bin:/usr/bin:/bin:/snap/bin"]
+
+
 def check(path=None, *, prepare_root=False):
     paths = list(dict.fromkeys(candidates())) if path is None else [path]
     if not paths:
@@ -77,9 +109,12 @@ def check(path=None, *, prepare_root=False):
     prefix = []
     if sys.platform == "linux" and os.geteuid() == 0:
         account = root_browser_account(prepare_root)
-        prefix = ["runuser", "-u", account.pw_name, "--", "env", "-i", "HOME=" + account.pw_dir,
-                  "USER=" + account.pw_name, "LOGNAME=" + account.pw_name,
-                  "PATH=/usr/local/bin:/usr/bin:/bin:/snap/bin"]
+        prefix = account_prefix(account, account.pw_dir)
+    return render_candidates(paths, prefix)
+
+
+def render_candidates(paths, prefix):
+    paths = list(dict.fromkeys(paths))
     failures = []
     deadline = time.monotonic() + 75
     for index, candidate in enumerate(paths):

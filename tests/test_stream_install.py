@@ -17,6 +17,8 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+INSTALL_URL = "https://raw.githubusercontent.com/gurudin/termlo-vps/main/install.sh"
+INSTALL_COMMAND = f"curl -fLO {INSTALL_URL} && sh install.sh"
 
 def endpoint(code):
     payload = code.strip().split("/")[-1]
@@ -53,6 +55,7 @@ class StreamInstallTests(unittest.TestCase):
 url=${!#}
 case $url in
     --version) exec "$REAL_CURL" --version ;;
+    "$INSTALL_URL") exec "$REAL_CURL" "$1" "$FIXTURE_INSTALL_URL" ;;
     file://*) exec "$REAL_CURL" "$@" ;;
     https://www.cloudflare.com/cdn-cgi/trace)
         echo probe >> "$HOME/geo-log"
@@ -64,7 +67,8 @@ esac
         (tools / "curl").chmod(0o755)
         self.env = dict(HOME=str(self.home), PATH=str(tools), XDG_CONFIG_HOME=str(self.home / "config"),
                         PYTHONDONTWRITEBYTECODE="1", PYTHONUTF8="1", TMPDIR=str(self.home),
-                        REAL_CURL=shutil.which("curl"), COUNTRY="US",
+                        REAL_CURL=shutil.which("curl"), COUNTRY="US", INSTALL_URL=INSTALL_URL,
+                        FIXTURE_INSTALL_URL=(ROOT / "install.sh").as_uri(),
                         SSH_CONNECTION="10.0.0.1 51870 2606:4700:4700::1111 2202")
         if sys.platform == "linux":
             (tools / "uname").symlink_to(shutil.which("uname"))
@@ -80,7 +84,7 @@ esac
         config.mkdir(parents=True)
         (config / "connection.json").write_text(json.dumps({"host_key": str(key) + ".pub"}))
 
-    def run_wizard(self, args, channel):
+    def run_in_terminal(self, args):
         pid, master = pty.fork()
         if pid == 0:
             os.chdir(self.home)
@@ -110,7 +114,10 @@ esac
             if time.monotonic() >= deadline:
                 os.killpg(pid, signal.SIGKILL)
             _, status = os.waitpid(pid, 0)
-        transcript = output.decode()
+        return status, output.decode()
+
+    def run_wizard(self, args, channel):
+        status, transcript = self.run_in_terminal(args)
         self.assertEqual(status, 0, transcript)
         self.assertIn("下载线路：" + channel, transcript)
         self.assertFalse((self.home / "bad-url").exists())
@@ -124,6 +131,24 @@ esac
         cli = str(self.home / ".local/bin/termlo")
         self.assertEqual(endpoint(subprocess.check_output([cli, "connection-code"], env=self.env, text=True)), server)
         return server
+
+    def test_public_install_command_rechecks_and_exits_before_a_blocked_reinstall(self):
+        readme = (ROOT / "README.md").read_text()
+        invocation = readme.split("```sh\n", 1)[1].split("\n```", 1)[0]
+        self.assertEqual(invocation, INSTALL_COMMAND)
+        self.run_wizard(["-c", invocation], "海外")
+        self.assertEqual((self.home / "install.sh").read_bytes(), self.bundle.read_bytes())
+        keys = self.home / ".ssh/authorized_keys"
+        before = keys.read_bytes()
+
+        (self.home / "bin/ssh-keyscan").write_text("#!/bin/sh\nexit 1\n")
+        status, transcript = self.run_in_terminal(["-c", invocation])
+        self.assertNotEqual(status, 0)
+        self.assertIn("体检未通过", transcript)
+        self.assertIn("ssh-keyscan -T 3 -p 2202", transcript)
+        self.assertNotIn("1/3", transcript)
+        self.assertNotIn("termlo://connect/", transcript)
+        self.assertEqual(keys.read_bytes(), before)
 
     def test_curl_pipe_reads_answers_from_terminal_and_emits_real_code(self):
         self.run_wizard(["-o", "pipefail", "-c", 'curl -fsSL "$1" | bash',
@@ -179,23 +204,25 @@ esac
         self.assertFalse((self.home / "config/termlo/connection.json").exists())
         self.assertTrue((self.home / ".mutagen/agents/0.18.1/mutagen-agent").exists())
 
-    def test_missing_python_bootstraps_packages_and_reuses_one_region_lookup(self):
+    def test_missing_runtime_blocks_all_install_changes_until_supplied(self):
         tools = self.home / "bin"
         (tools / "python3").unlink()
-        (tools / "env").symlink_to(shutil.which("env"))
-        (tools / "sudo").write_text('#!/bin/sh\n[ "$1" != -n ] || shift; [ "$1" != true ] || exit 0; exec "$@"\n')
-        (tools / "sudo").chmod(0o755)
-        (tools / "apt-get").write_text("""#!/bin/sh
-echo "$*" >> "$HOME/apt-log"
-case " $* " in *" --no-download "*) /bin/ln -s "$REAL_PYTHON" "$HOME/bin/python3" ;; esac
-""")
-        (tools / "apt-get").chmod(0o755)
-        self.env.update(REAL_PYTHON=sys.executable, COUNTRY="CN")
+        (tools / "apt-get").write_text('#!/bin/sh\n[ "$1" = --version ] || echo "$*" >> "$HOME/apt-log"\n')
+        self.env["COUNTRY"] = "CN"
+        status, transcript = self.run_in_terminal(["-c", INSTALL_COMMAND])
+        self.assertNotEqual(status, 0)
+        for row in ("[未通过] Python", "[未通过] 远程浏览器", "apt-get install -y python3", "[通过] 安装权限"):
+            self.assertIn(row, transcript)
+        self.assertNotIn("1/3", transcript)
+        self.assertFalse((self.home / "apt-log").exists())
+        self.assertFalse((self.home / ".ssh").exists())
+        self.assertFalse((self.home / ".local").exists())
+        (tools / "python3").symlink_to(sys.executable)
         result = subprocess.run(["bash", str(self.bundle), "--sync-only"], env=self.env, text=True,
                                 capture_output=True, check=True)
         self.assertTrue(result.stdout.startswith("termlo://connect/"))
         self.assertIn("下载线路：中国大陆", result.stderr)
-        self.assertIn("python3", (self.home / "apt-log").read_text())
+        self.assertFalse((self.home / "apt-log").exists())
         self.assertEqual((self.home / "geo-log").read_text().splitlines(), ["probe"])
 
     def test_no_terminal_or_incomplete_download_does_not_start_install(self):

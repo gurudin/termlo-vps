@@ -172,10 +172,10 @@ class Receipt:
                 packages[kind] = sorted(added.union(packages.get(kind, [])))
                 self.save()
 
-    def install_agent(self):
+    def install_agent(self, verified_archive=None):
         target = sync_agent.installed_path()
         new = not os.path.lexists(target)
-        path = sync_agent.install()
+        path = sync_agent.install(verified_archive) if verified_archive else sync_agent.install()
         if new:
             self.data["agents"][str(path.resolve())] = digest(path)
             self.save()

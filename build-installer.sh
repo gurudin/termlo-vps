@@ -11,17 +11,27 @@ trap 'rm -f -- "$stage"; if [[ -n $compat_stage ]]; then rm -f -- "$compat_stage
 cat > "$stage" <<'HEADER'
 #!/bin/sh
 set -eu
+termlo_unavailable_bundle() (
+HEADER
+# The checklist must still run when the payload cannot be unpacked.
+cat "$source_dir/python-runtime.sh" "$source_dir/prerequisites.sh" "$source_dir/doctor.sh" >> "$stage"
+printf "\nmanifest='%s'\n" "$(cat "$source_dir/mutagen-releases.txt")" >> "$stage"
+cat >> "$stage" <<'HEADER'
+scratch=''
+if has mktemp && has rm; then scratch=$(mktemp -d) || scratch=''; fi
+if [ -n "$scratch" ]; then trap 'rm -rf -- "$scratch"' EXIT; fi
+termlo_doctor '' "$manifest" /etc/os-release "$scratch" "$@"
+)
 termlo_install() (
+unpack_missing=''
+unpack_error=''
 for tool in mktemp base64 tar gzip cat dirname rm; do
-    if ! command -v "$tool" >/dev/null 2>&1; then
-        echo "[需处理] 安装包解压工具缺少 $tool。" >&2
-        echo "Debian/Ubuntu：apt-get install -y coreutils tar gzip；Alpine：apk add busybox tar gzip；RPM：dnf install -y coreutils tar gzip。用管理员账号执行后重试。" >&2
-        exit 1
-    fi
+    command -v "$tool" >/dev/null 2>&1 || unpack_missing="$unpack_missing $tool"
 done
-bundle=$(mktemp -d)
+if [ -n "$unpack_missing" ]; then termlo_unavailable_bundle "$@"; exit 1; fi
+bundle=$(mktemp -d) || { unpack_error='临时目录无法创建'; termlo_unavailable_bundle "$@"; exit 1; }
 trap 'rm -rf -- "$bundle"' EXIT
-base64 -d > "$bundle/archive.tgz" <<'TERMLO_ARCHIVE'
+if ! base64 -d > "$bundle/archive.tgz" <<'TERMLO_ARCHIVE'
 HEADER
 python3 - "$source_dir" >> "$stage" <<'PY'
 import base64
@@ -46,7 +56,10 @@ PY
 cat >> "$stage" <<'FOOTER'
 
 TERMLO_ARCHIVE
-tar -xzf "$bundle/archive.tgz" -C "$bundle"
+then unpack_error='安装包编码损坏'; termlo_unavailable_bundle "$@"; exit 1; fi
+if ! tar -xzf "$bundle/archive.tgz" -C "$bundle"; then
+    unpack_error='无法解压安装包'; termlo_unavailable_bundle "$@"; exit 1
+fi
 sh "$bundle/bootstrap.sh" "$@"
 )
 termlo_install "$@"

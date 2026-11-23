@@ -4,28 +4,15 @@
 
 ## 安装和连接
 
-把安装脚本保存到远程设备，在脚本所在目录运行下面这条命令。[下载 install.sh](https://raw.githubusercontent.com/gurudin/termlo-vps/main/install.sh)
+在要安装 Termlo 的设备上打开终端，运行这一行。
 
 ```sh
-sh install.sh
+curl -fLO https://raw.githubusercontent.com/gurudin/termlo-vps/main/install.sh && sh install.sh
 ```
 
-首次安装和以后重装都会重新体检并显示清单。可用的组件直接复用，缺少的组件自动准备。发现需要手动处理的项目时，会在安装前停下并显示处理方法。只查看清单可运行 `sh install.sh --check`。
+首次安装和每次重装都会先打印检查清单，每项显示「通过」或「未通过」。任何必需项未通过，脚本都会在该项下给出补齐方法，列完所有结果后退出。修复后重跑同一行命令即可重新检查。
 
-在全新服务器的 SSH 终端，可以先用下面的命令取得这个文件，再运行上面的安装命令。只有 wget 的设备可将 `curl -fLO` 换成 `wget`。
-
-```sh
-curl -fLO https://raw.githubusercontent.com/gurudin/termlo-vps/main/install.sh
-```
-
-<details>
-<summary>从空服务器的终端一行下载安装</summary>
-
-```sh
-setup=$(curl -fsSL https://raw.githubusercontent.com/gurudin/termlo-vps/main/install.sh) && sh -c "${setup:?安装脚本为空}"
-```
-
-</details>
+Bash、支持 TLS 的 Python 3.8+ 等安装前提必须可用。对于 Termlo 要安装的 Git、tmux、ADB、浏览器和同步代理，体检会检查现有工具或验证安装来源。全部通过后才开始安装、配置 SSH 和生成连接码。Claude Code 仍可选装。
 
 1. **确认 SSH 地址和端口。** 检查向导给出的建议值。使用 NAT 或端口映射时，填写你的 Mac 实际能访问的地址和对外端口。安装器核对本机 SSH 端口提供的公钥，新设备会自动安装 SSH 服务并生成缺少的主机密钥。已有服务保留原有身份。
 2. **准备开发环境。** 向导复用已有软件，安装缺项并检查各项工具。它会运行同步代理确认版本，启动原生浏览器、渲染一张本地测试页，然后关闭测试实例。只有 Claude Code 可以选装或跳过。必需项出错时会停止，处理后可以用同一条命令重试。

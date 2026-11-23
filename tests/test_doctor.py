@@ -1,5 +1,4 @@
 """Exercise the actual single-file installer before granting it any system changes."""
-from pathlib import Path
 import os
 import re
 import subprocess
@@ -7,7 +6,7 @@ import sys
 import unittest
 from unittest.mock import patch
 
-from test_stream_install import ROOT, StreamInstallTests as _Stream
+from test_stream_install import INSTALL_COMMAND, StreamInstallTests as _Stream
 from test_vps import command
 import native_browser
 
@@ -62,6 +61,47 @@ class DoctorTests(unittest.TestCase):
         self.assertNotIn("安装完成", run.stderr)
         self.assertFalse((self.home / ".local").exists())
 
+    def assert_checklist(self, result):
+        rows = re.findall(r"^  \[(通过|未通过)\] .+$", result.stderr, re.M)
+        self.assertTrue(rows, result.stderr)
+        failed = rows.count("未通过")
+        self.assertEqual(result.stderr.count("补齐方法  "), failed)
+        if failed:
+            self.assertIn(f"{len(rows)-failed} 项通过，{failed} 项未通过", result.stderr)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("体检通过。", result.stderr)
+        else:
+            self.assertIn(f"{len(rows)} 项全部通过", result.stderr)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_multiple_failures_are_reported_and_each_has_a_remedy(self):
+        tools = self.home / "bin"
+        (tools / "tmux").unlink()
+        command(tools / "ssh-keyscan", "exit 1")
+        command(tools / "chromium", "exit 2")
+        command(tools / "apt-get", '[ "$1" = --version ] && exit 0; [ "$1" = -s ] && exit 100; echo mutation >> "$HOME/events"')
+        result = self.run_installer("--without-claude")
+        self.assert_checklist(result)
+        for item in ("tmux 安装来源", "远程浏览器", "当前 SSH 会话"):
+            self.assertIn("[未通过] " + item, result.stderr)
+        self.assertIn("apt-get install -y tmux", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertFalse((self.home / "events").exists())
+        self.assertFalse((self.home / ".local").exists())
+        self.assertFalse((self.home / "config/termlo/install.lock").exists())
+
+    def test_unpack_tools_all_reported_before_install(self):
+        for name in ("base64", "gzip"):
+            (self.home / "bin" / name).unlink()
+        result = self.run_installer("--without-claude")
+        self.assert_checklist(result)
+        for name in ("base64", "gzip"):
+            self.assertIn("[未通过] 安装包解压工具  缺少 " + name, result.stderr)
+        self.assertIn("[通过] 远程系统", result.stderr)
+        self.assertIn("[未通过] 远程浏览器", result.stderr)
+        self.assertFalse((self.home / ".local").exists())
+        self.assertFalse((self.home / ".ssh").exists())
+
     def test_browser_falls_back_to_a_working_candidate_after_render_failure(self):
         bad = self.home / "bin/chromium"
         good = self.home / "bin/google-chrome"
@@ -74,23 +114,16 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(checked.returncode, 0, checked.stderr)
         self.assertIn("已渲染测试页  " + str(good), checked.stderr)
 
-    def test_one_line_download_never_executes_an_empty_or_failed_transfer(self):
-        readme = (ROOT / "README.md").read_text()
-        invocation = re.search(r"^setup=.+$", readme, re.M).group()
-        for code in (0, 37):
+    def test_public_command_does_not_run_a_partial_or_stale_file_after_a_failed_download(self):
+        installer = self.home / "install.sh"
+        for code, partial in ((22, ""), (18, "echo 'echo partial > ran' > install.sh\n")):
             with self.subTest(code=code):
-                command(self.home / "bin/curl", ("printf '%s\\n' 'touch \"$HOME/partial-ran\"'\n" if code else "")
-                        + f"exit {code}")
-                run = subprocess.run(["/bin/sh", "-c", invocation], env=self.env, capture_output=True)
-                self.assertNotEqual(run.returncode, 0)
-                self.assertFalse((self.home / "partial-ran").exists())
-        local = invocation.replace("https://raw.githubusercontent.com/gurudin/termlo-vps/main/install.sh",
-                                   self.bundle.as_uri())
-        command(self.home / "bin/curl", 'exec "$REAL_CURL" "$@"')
-        outcome = subprocess.run(["/bin/sh", "-c", local + " termlo --check --sync-only"], env=self.env,
-                                 capture_output=True, text=True)
-        self.assertEqual(outcome.returncode, 0, outcome.stderr)
-        self.assertIn("体检通过", outcome.stderr)
+                installer.write_text("echo stale > ran\n")
+                command(self.home / "bin/curl", partial + f"exit {code}")
+                run = subprocess.run(["/bin/sh", "-c", INSTALL_COMMAND], cwd=self.home,
+                                     env=self.env, capture_output=True)
+                self.assertEqual(run.returncode, code)
+                self.assertFalse((self.home / "ran").exists())
 
     def test_normal_reinstall_rechecks_the_current_environment_before_changing_any_binding(self):
         first = self.run_installer("--sync-only")
@@ -104,8 +137,6 @@ class DoctorTests(unittest.TestCase):
         self.assertIn("体检未通过", second.stderr)
         self.assertEqual(authorized.read_bytes(), before)
         self.assertEqual(second.stdout, "")
-
-
 
 # unittest discovery also sees TestCase classes imported into this module.
 del _Stream
