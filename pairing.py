@@ -20,6 +20,19 @@ ED25519_PREFIX = b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20"
 RECEIPT = "termlo-paired-v2"
 
 
+def check_authorization_directories():
+    # OpenSSH's default StrictModes checks the directories leading to
+    # authorized_keys, even when the file itself has mode 0600.
+    unsafe = []
+    home = Path.home()
+    for path, label in ((home, '"$HOME"'), (home / ".ssh", '"$HOME/.ssh"')):
+        if path.is_dir() and path.stat().st_mode & 0o022:
+            unsafe.append(label)
+    if unsafe:
+        targets = " ".join(unsafe)
+        raise ValueError(f"{targets} 允许组或其他用户写入。请用该账号收紧目录权限后重试：\n             chmod go-w {targets}")
+
+
 def account_file(path, *, replace):
     """Check a lock opened for append or a key file updated by atomic rename."""
     try:
@@ -126,6 +139,7 @@ def ssh_expiry_time(expires, utc_expiry):
 
 @contextmanager
 def pending_invitation(locked_keys, *, utc_expiry=False):
+    check_authorization_directories()
     with tempfile.TemporaryDirectory() as temp:
         key = Path(temp) / "invite"
         subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "", "-f", str(key)],

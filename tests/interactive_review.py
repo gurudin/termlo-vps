@@ -121,6 +121,17 @@ def verify():
             if ENTRY != PUBLIC:
                 (work / "install.sh").write_bytes((ROOT / "install.sh").read_bytes())
             launch = ["/bin/sh", "-c", ENTRY]
+            bad = [p for p in (pathlib.Path.home(), sshdir) if p.stat().st_mode & 0o022]
+            if bad:
+                keys = sshdir / "authorized_keys"
+                previous = keys.read_bytes()
+                status, report = wizard(launch)
+                if not (status and "[未通过] SSH 授权目录权限" in report and "chmod go-w" in report and "1/3" not in report and "termlo://connect/" not in report):
+                    raise RuntimeError("Insecure SSH directories did not stop installation\n" + diagnostic(report))
+                assert previous == keys.read_bytes() and not (pathlib.Path.home() / ".local/bin/termlo").exists()
+                output(["chmod","go-w",*bad])
+                assert output([*SSH, "-o", "UserKnownHostsFile=" + str(pin), "-i", normal, user + "@" + host, "printf ordinary"]) == "ordinary"
+                print("Real Mac: listed the SSH permissions repair before writing a binding; ordinary SSH login works after applying it", flush=True)
         else:
             known = work / "bootstrap.known"
             known.write_text(host + " " + output(["docker", "exec", "termlo-review", "cat", "/etc/ssh/ssh_host_ed25519_key.pub"]) + "\n")

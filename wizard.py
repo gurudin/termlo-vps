@@ -80,9 +80,12 @@ def public_egress_address(region="global"):
     return None
 
 
-def suggest_host(ssh_address, region="global", egress=None):
-    if ssh_address and usable_address(ssh_address) and (ssh_address.is_global or sys.platform == "darwin"):
-        return str(ssh_address), "当前 SSH 会话"
+def suggest_host(ssh_address, region="global", egress=None, *, client=None):
+    if ssh_address and usable_address(ssh_address):
+        if ssh_address.is_global or sys.platform == "darwin":
+            return str(ssh_address), "当前 SSH 会话"
+        if client and client.version == ssh_address.version and usable_address(client) and not client.is_global:
+            return str(ssh_address), "当前内网 SSH 会话，经过跳板或端口映射时请核对"
     addresses = local_addresses()
     if sys.platform == "darwin" and addresses:
         return str(addresses[0]), "本机网络地址，跨网连接请核对"
