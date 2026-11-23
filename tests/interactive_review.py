@@ -102,6 +102,22 @@ def verify():
         if mac:
             assert not (pathlib.Path.home() / ".config/termlo/connection.json").exists()
             assert not (pathlib.Path.home() / ".local/bin/termlo").exists()
+            normal = work / "normal"
+            output(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", normal])
+            sshdir = pathlib.Path.home() / ".ssh"
+            sshdir.mkdir(mode=0o700, exist_ok=True)
+            with (sshdir / "authorized_keys").open("a") as out:
+                out.write("\n" + normal.with_suffix(".pub").read_text())
+            pin = work / "normal.known"
+            pin.write_text(output(["ssh-keyscan", "-T", "3", "-t", "ed25519", host]) + "\n")
+            normal_login = subprocess.run([*SSH, "-o", "UserKnownHostsFile=" + str(pin), "-i", normal, user + "@" + host, "printf ordinary"], capture_output=True, text=True)
+            print("Ordinary SSH login before Termlo: " + ("passed" if normal_login.stdout == "ordinary" else "failed"), flush=True)
+            for item in [pathlib.Path.home(), sshdir, sshdir / "authorized_keys"]:
+                print("SSH directory or file:", item.name, oct(item.stat().st_mode & 0o777), "uid", item.stat().st_uid, flush=True)
+            settings = output(["sudo","/usr/sbin/sshd","-T","-C", f"user={user},host=localhost,addr={host}"])
+            print("\n".join(line for line in settings.splitlines() if line.split()[0] in
+                ("strictmodes","pubkeyauthentication","authorizedkeysfile","authenticationmethods","allowusers","denyusers","allowgroups","denygroups")), flush=True)
+            print(subprocess.run(["/usr/bin/dscl",".","-read","/Groups/com.apple.access_ssh","GroupMembership"],capture_output=True,text=True).stdout.strip(), flush=True)
             if ENTRY != PUBLIC:
                 (work / "install.sh").write_bytes((ROOT / "install.sh").read_bytes())
             launch = ["/bin/sh", "-c", ENTRY]
@@ -127,8 +143,9 @@ def verify():
         print("All wizard defaults accepted; exactly one code from reviewed installer " + actual, flush=True)
         optional_failed = "Claude Code 安装失败" in transcript
         if optional_failed:
-            rows = [line for line in transcript.splitlines() if "Claude Code 安装失败" in line or "curl:" in line]
-            print("Optional Claude download result: " + diagnostic("\n".join(rows))[-600:], flush=True)
+            start = transcript.find("正在为当前 SSH 用户安装 Claude")
+            end = transcript.find("跳过，继续安装向导", max(0,start))
+            print("Optional Claude download result: " + diagnostic(transcript[max(0,start):end])[-2200:], flush=True)
         if payload["host"] != host or payload["port"] != 22:
             why = re.search(r"服务器地址（([^）]+)）", transcript)
             print("Returned endpoint matches known SSH login: no; address source: " + (why[1] if why else "unknown"), flush=True)

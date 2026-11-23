@@ -33,7 +33,7 @@ jobs:
           gateway=$(docker network inspect -f '{{(index .IPAM.Config 0).Gateway}}' termlo-review-net)
           printf 'ListenAddress %s\nListenAddress 127.0.0.1\nPermitRootLogin prohibit-password\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nUsePAM no\nDisableForwarding yes\nAllowUsers root@%s\nSubsystem sftp internal-sftp\n' "$host" "$gateway" > "$RUNNER_TEMP/private-sshd.conf"
           docker cp "$RUNNER_TEMP/private-sshd.conf" termlo-review:/run/review-sshd.conf
-          docker exec termlo-review sh -ec 'chmod 600 /root/.ssh/authorized_keys; /usr/sbin/sshd -f /run/review-sshd.conf'
+          docker exec termlo-review sh -ec 'usermod -p "*" root; chown root:root /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys; /usr/sbin/sshd -E /run/review-sshd.log -f /run/review-sshd.conf'
           printf 'REVIEW_HOST=%s\nREVIEW_USER=root\nREVIEW_BOOTSTRAP=%s/review-bootstrap\n' "$host" "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Prepare a private SSH listener for a fresh Mac console
         if: runner.os == 'macOS'
@@ -54,3 +54,6 @@ jobs:
       - name: Use the public command, accept the defaults and bind a new client
         shell: bash
         run: python3 -B tests/interactive_review.py
+      - name: Diagnose the private Debian listener
+        if: failure() && runner.os == 'Linux'
+        run: docker exec termlo-review sh -c 'tail -18 /run/review-sshd.log'
