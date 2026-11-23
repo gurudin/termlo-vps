@@ -110,6 +110,9 @@ def claude_dirs():
     return {path.resolve() / "claude/versions" for path in (base, xdg) if path.is_absolute()}
 
 
+BROWSER_RUNTIME_DIRS = {".cache", ".config", ".local", ".pki", "snap"}
+
+
 def browser_home_stamp(home, uid):
     """Identify the private home useradd created. Never follow links into other data."""
     try:
@@ -123,10 +126,17 @@ def browser_home_stamp(home, uid):
             item = path.lstat()
             if item.st_dev != info.st_dev or (path != home and path.is_mount()):
                 return None
-            fields = [str(path.relative_to(home)), item.st_dev, item.st_ino, item.st_mode, item.st_uid, item.st_gid]
+            rel = path.relative_to(home)
+            in_runtime = (bool(rel.parts) and rel.parts[0] in BROWSER_RUNTIME_DIRS
+                          and (len(rel.parts) > 1 or stat.S_ISDIR(item.st_mode)))
+            if in_runtime and item.st_uid != uid:
+                return None
             if stat.S_ISDIR(item.st_mode):
                 entries.extend(sorted(path.iterdir()))
-            else:
+            if in_runtime:
+                continue
+            fields = [str(rel), item.st_dev, item.st_ino, item.st_mode, item.st_uid, item.st_gid]
+            if not stat.S_ISDIR(item.st_mode):
                 fields.extend([item.st_size, item.st_mtime_ns])
             stamp.update(json.dumps(fields).encode() + b"\n")
         return stamp.hexdigest()

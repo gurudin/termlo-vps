@@ -7,6 +7,7 @@ source_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 system=$(uname -s 2>/dev/null) || system=''
 case $system in Darwin) PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" ;; *) PATH="$PATH:/usr/sbin:/sbin" ;; esac
 export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"
+export PYTHONUTF8=1
 case ${1:-} in
     -h|--help)
         printf '%s\n' 'sh install.sh [--check] [--host 地址] [--port 对外端口] [--host-key 主机公钥] [--name 名称]' \
@@ -15,7 +16,7 @@ case ${1:-} in
     uninstall|--uninstall)
         shift
         interpreter=$(find_python) || { echo '卸载需要 Python 3.8 或更高版本。请运行 sh install.sh --check 查看本机的 Python 安装命令。' >&2; exit 1; }
-        exec "$interpreter" -B "$source_dir/termlo.py" uninstall "$@" ;;
+        exec "$interpreter" -X utf8 -B "$source_dir/termlo.py" uninstall "$@" ;;
 esac
 scratch=$(mktemp -d) || scratch=''
 if [ -n "$scratch" ]; then trap 'rm -rf -- "$scratch"' EXIT; fi
@@ -25,4 +26,4 @@ termlo_doctor "$source_dir" "$(cat "$source_dir/mutagen-releases.txt")" /etc/os-
 for arg do [ "$arg" != --check ] || exit 0; done
 if [ "$#" = 0 ]; then exec </dev/tty; fi
 interpreter=$(find_python) || { echo 'Python 已不可用，请重新运行安装命令检查环境。' >&2; exit 1; }
-"$interpreter" -B "$source_dir/bootstrap.py" "$scratch" install "$@"
+"$interpreter" -X utf8 -B "$source_dir/bootstrap.py" "$scratch" install "$@"

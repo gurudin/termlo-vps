@@ -158,7 +158,33 @@ class BrowserInstallTests(unittest.TestCase):
                  patch("subprocess.run", side_effect=run_command) as run:
                 termlo.ensure_browser(packages)
         install_packages.assert_not_called()
-        self.assertIn(call(["sudo", "snap", "install", "chromium"], check=True), run.call_args_list)
+        self.assertIn(call(["sudo", "snap", "install", "chromium"], stdout=sys.stderr, check=True), run.call_args_list)
+        self.assertIn(call(["sudo", "snap", "wait", "system", "seed.loaded"], stdout=sys.stderr, timeout=240, check=True),
+                      run.call_args_list)
+
+    def test_ubuntu_snap_stub_is_ignored_and_root_preflight_defers_snap_probe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = Path(tmp) / "chromium-browser"
+            stub.write_text("#!/bin/sh\necho 'Requires the chromium snap: snap install chromium'\nexit 1\n")
+            stub.chmod(0o755)
+            with patch.object(sys, "platform", "linux"), \
+                 patch("shutil.which", side_effect=lambda name: str(stub) if name == "chromium-browser" else None), \
+                 patch("os.access", return_value=False):
+                self.assertIsNone(native_browser.executable())
+            with patch.object(sys, "platform", "linux"), patch.object(os, "geteuid", return_value=0), \
+                 patch("pwd.getpwnam", side_effect=KeyError), \
+                 patch("shutil.which", return_value=None), \
+                 patch("os.access", side_effect=lambda p, mode: p == "/snap/bin/chromium"):
+                with self.assertRaises(native_browser.SnapProbeDeferred) as deferred:
+                    native_browser.check_for_install()
+                self.assertEqual(str(deferred.exception), "/snap/bin/chromium")
+
+    def test_mac_git_stub_checks_xcode_select_before_running_git(self):
+        with patch.object(sys, "platform", "darwin"), patch("shutil.which", return_value="/usr/bin/git"), \
+             patch("subprocess.run", return_value=subprocess.CompletedProcess([], 2)) as run:
+            self.assertFalse(termlo.tool_works(["git", "--version"]))
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0], ["/usr/bin/xcode-select", "-p"])
 
     def test_ubuntu_repairs_unusable_snap_cli_and_checks_the_stable_architecture(self):
         packages = Mock()

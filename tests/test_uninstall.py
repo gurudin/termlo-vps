@@ -279,6 +279,16 @@ class UninstallTests(unittest.TestCase):
         scratch.mkdir()
         scratch.rmdir()
         self.assertEqual(uninstall.browser_home_stamp(folder, os.getuid()), first)
+        for runtime in (".pki/nssdb/cert9.db", ".cache/fontconfig/cache", ".config/chromium/state", "snap/chromium/common/data"):
+            target = folder / runtime
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("browser runtime state")
+        self.assertEqual(uninstall.browser_home_stamp(folder, os.getuid()), first)
+        # A regular file named after a runtime directory is not a browser directory.
+        (folder / ".local").write_text("user file")
+        self.assertNotEqual(uninstall.browser_home_stamp(folder, os.getuid()), first)
+        (folder / ".local").unlink()
+        self.assertEqual(uninstall.browser_home_stamp(folder, os.getuid()), first)
         (folder / "my-project").write_text("keep")
         self.assertNotEqual(uninstall.browser_home_stamp(folder, os.getuid()), first)
 

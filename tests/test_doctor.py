@@ -1,6 +1,7 @@
 """Exercise the actual single-file installer before granting it any system changes."""
 import json
 import os
+from pathlib import Path
 import re
 import shutil
 import subprocess
@@ -580,6 +581,74 @@ esac''')
         self.assertIn("体检未通过", second.stderr)
         self.assertEqual(authorized.read_bytes(), before)
         self.assertEqual(second.stdout, "")
+
+    def test_unprivileged_check_on_stopped_sshd_does_not_misreport_root_host_keys(self):
+        self.env.pop("SSH_CONNECTION")
+        tools = self.home / "bin"
+        command(tools / "ssh-keyscan", "exit 1")
+        command(tools / "sudo", "exit 1")
+        command(tools / "sshd", '''
+case " $* " in
+    *" -h "*) exit 0 ;;
+    *" -t "*) echo "Could not load host key: /etc/ssh/ssh_host_ed25519_key" >&2
+              echo "sshd: no hostkeys available -- exiting." >&2
+              exit 255 ;;
+    *" -G "*) echo "pubkeyauthentication yes"
+              echo "authorizedkeysfile .ssh/authorized_keys" ;;
+esac''')
+        result = self.run_installer("--check", "--sync-only", "--host", "dev.example")
+        self.assert_checklist(result)
+        self.assertIn("[未通过] 安装权限", result.stderr)
+        self.assertIn("[通过] SSH 服务配置", result.stderr)
+        self.assertNotIn("HostKey 路径或权限", result.stderr)
+
+    def test_sshd_auth_policy_blocks_disabled_pubkey_or_custom_authorized_keys(self):
+        tools = self.home / "bin"
+        for output, expected in (
+            ("pubkeyauthentication no\nauthorizedkeysfile .ssh/authorized_keys\n", "PubkeyAuthentication yes"),
+            ("pubkeyauthentication yes\nauthorizedkeysfile /etc/ssh/keys/%u\n", "AuthorizedKeysFile"),
+        ):
+            with self.subTest(expected=expected):
+                command(tools / "sshd", f'printf "{output}"')
+                result = self.run_installer("--check", "--sync-only")
+                self.assert_checklist(result)
+                self.assertIn("[未通过] SSH 公钥登录策略", result.stderr)
+                self.assertIn(expected, result.stderr)
+        # Verify forced-commands-only is blocked for root, while %u home paths are accepted.
+        prereq = str(Path(__file__).resolve().parents[1] / "prerequisites.sh")
+        command(tools / "sshd", 'printf "pubkeyauthentication yes\\npermitrootlogin forced-commands-only\\nauthorizedkeysfile .ssh/authorized_keys\\n"')
+        root_blocked = subprocess.run(["sh", "-ec", '. "$1"; check_sshd_auth_policy "" "" 0 root', "check", prereq],
+                                      env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(root_blocked.returncode, 0)
+        self.assertIn("forced-commands-only", root_blocked.stdout)
+        command(tools / "sshd", "printf '%s\\n' 'pubkeyauthentication yes' 'authorizedkeysfile /home/%u/.ssh/authorized_keys'")
+        user_ok = subprocess.run(["sh", "-ec", '. "$1"; HOME=/home/alice check_sshd_auth_policy "" "" 1000 alice', "check", prereq],
+                                 env=self.env, capture_output=True, text=True)
+        self.assertEqual(user_ok.returncode, 0, user_ok.stdout)
+
+    def test_mutagen_tls_failure_mentions_ca_certificates(self):
+        (self.home / ".mutagen/agents/0.18.1/mutagen-agent").unlink()
+        command(self.home / "bin/curl", '[ "$1" = --version ] || exit 60')
+        result = self.run_installer("--check", "--sync-only")
+        self.assert_checklist(result)
+        self.assertIn("ca-certificates", result.stderr)
+        self.assertIn("curl 错误码 60", result.stderr)
+
+    def test_rpm_preflight_uses_showduplicates_for_reinstall_candidates(self):
+        tools = self.home / "bin"
+        (tools / "apt-get").unlink()
+        (tools / "tmux").unlink()
+        command(tools / "dnf", '''
+[ "$1" != --version ] || exit 0
+case " $* " in *" list --showduplicates --available tmux "*) exit 0 ;; *) exit 1 ;; esac''')
+        release = self.home / "os-release"
+        release.write_text('ID=rocky\nVERSION_ID="9.4"\nPLATFORM_ID="platform:el9"\n')
+        probe = subprocess.run(
+            ["sh", "-ec", '. "$1"; . "$2"; family=rpm; manager=dnf; scratch=$3; release=$4; package_available tmux',
+             "check", str(Path(__file__).resolve().parents[1] / "prerequisites.sh"),
+             str(Path(__file__).resolve().parents[1] / "doctor.sh"), str(self.home), str(release)],
+            env=self.env, capture_output=True, text=True)
+        self.assertEqual(probe.returncode, 0, probe.stderr)
 
 # unittest discovery also sees TestCase classes imported into this module.
 del _Stream

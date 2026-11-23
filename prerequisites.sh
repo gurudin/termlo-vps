@@ -170,7 +170,8 @@ ENDPOINT
             addresses="$addresses $(ifconfig -a 2>/dev/null | awk '$1=="inet" || $1=="inet6" { print $2 }')"
         fi
         if has sshd && has awk; then
-            ports="$ports $("$(command -v sshd)" -T 2>/dev/null | awk '$1=="port" { print $2 }')"
+            daemon=$(command -v sshd)
+            ports="$ports $({ "$daemon" -G 2>/dev/null || "$daemon" -T 2>/dev/null; } | awk '$1=="port" { print $2 }')"
         fi
     fi
     for port in $ports; do
@@ -215,38 +216,44 @@ check_sshd_config() (
     scratch=$1; system=$2; priv=$3
     daemon=$(command -v sshd) || return 1
     set -- "$daemon"
-    if [ -n "$priv" ] && "${priv% }" -n true </dev/null >/dev/null 2>&1; then
+    privileged=0
+    if [ "$(id -u)" = 0 ]; then
+        privileged=1
+    elif [ -n "$priv" ] && "${priv% }" -n true </dev/null >/dev/null 2>&1; then
         set -- "${priv% }" -n "$daemon"
+        privileged=1
     fi
     if reason=$(LC_ALL=C "$@" -t 2>&1 >/dev/null); then return 0; fi
     case $reason in *'no hostkeys available -- exiting.'*)
-        # ssh-keygen -A only creates missing default identities. A temporary -h
-        # key alone would also make a configuration with unusable custom keys pass.
-        generates=0; listed=0
-        if effective=$(LC_ALL=C "$@" -G 2>/dev/null); then
-            while IFS= read -r line; do
-                case $line in 'hostkey '*) can_generate_sshd_key "${line#hostkey }" && generates=1 ;; esac
-            done <<CONFIG
+        if [ "$privileged" = 1 ]; then
+            # ssh-keygen -A only creates missing default identities. A temporary -h
+            # key alone would also make a configuration with unusable custom keys pass.
+            generates=0; listed=0
+            if effective=$(LC_ALL=C "$@" -G 2>/dev/null); then
+                while IFS= read -r line; do
+                    case $line in 'hostkey '*) can_generate_sshd_key "${line#hostkey }" && generates=1 ;; esac
+                done <<CONFIG
 $effective
 CONFIG
-        else
-            # Older sshd reports each explicitly configured unusable key on stderr.
-            while IFS= read -r line; do
-                case $line in *'load host key: '*)
-                    listed=1; path=${line#*load host key: }; can_generate_sshd_key "${path%"$(printf '\r')"}" && generates=1 ;;
-                esac
-            done <<DIAGNOSTICS
+            else
+                # Older sshd reports each explicitly configured unusable key on stderr.
+                while IFS= read -r line; do
+                    case $line in *'load host key: '*)
+                        listed=1; path=${line#*load host key: }; can_generate_sshd_key "${path%"$(printf '\r')"}" && generates=1 ;;
+                    esac
+                done <<DIAGNOSTICS
 $reason
 DIAGNOSTICS
-            if [ "$listed" = 0 ]; then
-                for path in /etc/ssh/ssh_host_rsa_key /etc/ssh/ssh_host_ecdsa_key /etc/ssh/ssh_host_ed25519_key; do
-                    can_generate_sshd_key "$path" && generates=1
-                done
+                if [ "$listed" = 0 ]; then
+                    for path in /etc/ssh/ssh_host_rsa_key /etc/ssh/ssh_host_ecdsa_key /etc/ssh/ssh_host_ed25519_key; do
+                        can_generate_sshd_key "$path" && generates=1
+                    done
+                fi
             fi
-        fi
-        if [ "$generates" = 0 ]; then
-            printf '%s\n' "$reason" '请修复 sshd_config 中的 HostKey 路径或权限，或恢复发行版默认的 HostKey 配置。'
-            return 1
+            if [ "$generates" = 0 ]; then
+                printf '%s\n' "$reason" '请修复 sshd_config 中的 HostKey 路径或权限，或恢复发行版默认的 HostKey 配置。'
+                return 1
+            fi
         fi
         [ -n "$scratch" ] && [ -f "$scratch/pairing-check" ] || return 0
         if reason=$(LC_ALL=C "$@" -t -h "$scratch/pairing-check" 2>&1 >/dev/null); then return 0; fi ;;
@@ -259,6 +266,79 @@ DIAGNOSTICS
     esac
     printf '%s\n' "${reason:-sshd 配置检查失败}"
     return 1
+)
+
+check_sshd_auth_policy() (
+    scratch=$1; priv=$2; uid=$3; user=$4
+    daemon=$(command -v sshd) || return 0
+    effective=''
+    if [ "$uid" = 0 ]; then
+        set -- "$daemon"
+        can_eval=1
+    elif [ -n "$priv" ] && "${priv% }" -n true </dev/null >/dev/null 2>&1; then
+        set -- "${priv% }" -n "$daemon"
+        can_eval=1
+    else
+        set -- "$daemon"
+        can_eval=0
+    fi
+    if [ "$can_eval" = 1 ] && [ -n "$user" ]; then
+        effective=$(LC_ALL=C "$@" -T -C "user=$user,host=localhost,addr=127.0.0.1" 2>/dev/null) || effective=''
+        if [ -z "$effective" ] && [ -n "$scratch" ] && [ -f "$scratch/pairing-check" ]; then
+            effective=$(LC_ALL=C "$@" -T -h "$scratch/pairing-check" -C "user=$user,host=localhost,addr=127.0.0.1" 2>/dev/null) || effective=''
+        fi
+    fi
+    if [ -z "$effective" ]; then
+        effective=$(LC_ALL=C "$@" -G 2>/dev/null) || return 0
+    fi
+    [ -n "$effective" ] || return 0
+    pubkey=''; root_login=''; auth_files=''
+    while IFS= read -r line; do
+        line=${line%"$(printf '\r')"}
+        case $line in
+            'pubkeyauthentication '*) pubkey=${line#pubkeyauthentication } ;;
+            'permitrootlogin '*) root_login=${line#permitrootlogin } ;;
+            'authorizedkeysfile '*) auth_files=${line#authorizedkeysfile } ;;
+        esac
+    done <<CONFIG
+$effective
+CONFIG
+    if [ "$pubkey" = no ]; then
+        printf '%s\n' 'SSH 服务已禁用公钥登录（PubkeyAuthentication no）' '请在 sshd_config 中设置 PubkeyAuthentication yes 并重载 SSH 服务。'
+        return 1
+    fi
+    if [ "$uid" = 0 ]; then
+        case $root_login in
+            no|forced-commands-only)
+                printf '%s\n' "SSH 服务限制 root 登录（PermitRootLogin $root_login）" '请改用普通 SSH 账号安装，或在 sshd_config 中设置 PermitRootLogin prohibit-password 后重载 SSH 服务。'
+                return 1 ;;
+        esac
+    fi
+    if [ -n "$auth_files" ]; then
+        matches=0
+        set -f
+        home_clean=${HOME%/}
+        user_pattern=''
+        if [ -n "$user" ]; then
+            case $home_clean in
+                *"/$user") user_pattern="${home_clean%"/$user"}/%u/.ssh/authorized_keys" ;;
+            esac
+        fi
+        for entry in $auth_files; do
+            case $entry in
+                .ssh/authorized_keys|'~/.ssh/authorized_keys'|'%h/.ssh/authorized_keys'|"$home_clean/.ssh/authorized_keys")
+                    matches=1; break ;;
+                "$user_pattern")
+                    [ -n "$user_pattern" ] && { matches=1; break; } ;;
+            esac
+        done
+        set +f
+        if [ "$matches" = 0 ]; then
+            printf '%s\n' "SSH 服务未启用默认授权文件（AuthorizedKeysFile $auth_files）" '请在 sshd_config 的 AuthorizedKeysFile 中包含 .ssh/authorized_keys 并重载 SSH 服务。'
+            return 1
+        fi
+    fi
+    return 0
 )
 
 prepare_sshd() (

@@ -267,10 +267,10 @@ class SystemPackages:
     def install_chromium_snap(self):
         privilege = [] if os.getuid() == 0 else ["sudo" if shutil.which("sudo") else "doas"]
         if Path("/run/systemd/system").is_dir():
-            subprocess.run([*privilege, "systemctl", "start", "snapd.socket"], check=True, timeout=60)
-        subprocess.run([*privilege, "snap", "wait", "system", "seed.loaded"], timeout=240, check=True)
+            subprocess.run([*privilege, "systemctl", "start", "snapd.socket"], stdout=sys.stderr, check=True, timeout=60)
+        subprocess.run([*privilege, "snap", "wait", "system", "seed.loaded"], stdout=sys.stderr, timeout=240, check=True)
         with self.receipt.observe_packages("snap", ["chromium"]):
-            subprocess.run([*privilege, "snap", "install", "chromium"], check=True)
+            subprocess.run([*privilege, "snap", "install", "chromium"], stdout=sys.stderr, check=True)
 
 
 def claude_available():
@@ -323,6 +323,14 @@ def ensure_browser(packages):
 
 
 def tool_works(command):
+    if (sys.platform == "darwin" and command and command[0] == "git"
+            and shutil.which("git") == "/usr/bin/git"):
+        try:
+            if subprocess.run(["/usr/bin/xcode-select", "-p"], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10).returncode != 0:
+                return False
+        except (OSError, subprocess.TimeoutExpired):
+            return False
     try:
         return subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, timeout=10).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
@@ -393,12 +401,13 @@ def install_cli():
         else:
             with stage.open("wb") as output:
                 output.write(b"#!/bin/sh\n")
+                output.write(b'case $(uname -s 2>/dev/null) in Darwin) PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" ;; esac\n')
                 output.write(helper_source("python-runtime.sh"))
                 candidates = (sys.executable, getattr(sys, "_base_executable", None))
                 preferred = " ".join(shlex.quote(p) for p in dict.fromkeys(candidates) if p)
                 output.write(("\npy=$(find_python " + preferred + ") || { "
                               "echo 'Termlo 需要可用的 Python 3.8+，请重新运行安装命令检查环境。' >&2; exit 1; }\n"
-                              'exec "$py" -B "$0" "$@"\nexit 1\n').encode())
+                              'exec "$py" -X utf8 -B "$0" "$@"\nexit 1\n').encode())
                 with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED, strict_timestamps=False) as bundle:
                     for name in ("termlo.py", "connection_code.py", "pairing.py", "browser.py", "native_browser.py",
                                  "sync_agent.py", "mutagen-releases.txt", "uninstall.py", "wizard.py", "sources.sh", "doctor.sh", "prerequisites.sh", "python-runtime.sh"):

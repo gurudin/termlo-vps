@@ -15,6 +15,26 @@ import time
 ROOT_BROWSER_USER = "termlo-browser"
 
 
+class SnapProbeDeferred(Exception):
+    """Snap Chromium is installed, but root preflight cannot run it before creating termlo-browser."""
+
+
+def is_ubuntu_snap_stub(path):
+    if sys.platform != "linux" or Path(path).name != "chromium-browser" or os.access("/snap/bin/chromium", os.X_OK):
+        return False
+    try:
+        with open(path, "rb") as stream:
+            head = stream.read(4096)
+    except OSError:
+        return False
+    return head.startswith(b"#!") and (b"snap install chromium" in head or b"/snap/bin/chromium" in head)
+
+
+def is_snap_candidate(path):
+    return (sys.platform == "linux" and os.access("/snap/bin/chromium", os.X_OK)
+            and (path == "/snap/bin/chromium" or Path(path).name == "chromium-browser"))
+
+
 def candidates():
     if sys.platform == "darwin":
         apps = (("Chromium", "Chromium"), ("Google Chrome", "Google Chrome"),
@@ -26,7 +46,7 @@ def candidates():
                     yield str(path)
     for name in ("chromium", "google-chrome-stable", "google-chrome", "chromium-browser"):
         path = shutil.which(name)
-        if path:
+        if path and not is_ubuntu_snap_stub(path):
             yield path
     if sys.platform == "linux" and os.access("/snap/bin/chromium", os.X_OK):
         yield "/snap/bin/chromium"
@@ -58,7 +78,7 @@ def root_browser_account(create):
         if not create:
             raise ValueError("请重新运行安装器，准备 Chromium 的非登录运行账号。") from None
         subprocess.run(["useradd", "--system", "--user-group", "--create-home", "--home-dir", home,
-                        "--shell", "/usr/sbin/nologin", ROOT_BROWSER_USER], check=True)
+                        "--shell", "/usr/sbin/nologin", ROOT_BROWSER_USER], stdout=sys.stderr, check=True)
         account = pwd.getpwnam(ROOT_BROWSER_USER)
     if account.pw_uid == 0 or account.pw_gid == 0 or account.pw_dir != home or account.pw_shell not in ("/usr/sbin/nologin", "/sbin/nologin", "/bin/false"):
         raise ValueError(f"已有其他用途的 {ROOT_BROWSER_USER} 账号，请核对后重试。")
@@ -106,6 +126,14 @@ def check_for_install():
         try:
             pwd.getpwnam(ROOT_BROWSER_USER)
         except KeyError:
+            found = list(dict.fromkeys(candidates()))
+            if not found:
+                raise ValueError("找不到原生 Chromium 或 Chrome，请重新运行 Termlo 安装器。") from None
+            non_snap = [path for path in found if not is_snap_candidate(path)]
+            snap_paths = [path for path in found if is_snap_candidate(path)]
+            if not non_snap and snap_paths:
+                # Snap confinement rejects nobody (/nonexistent) and /tmp homes; render once termlo-browser is created.
+                raise SnapProbeDeferred(snap_paths[0]) from None
             # Test the installed browser without creating its permanent service account.
             try:
                 account = pwd.getpwnam("nobody")
@@ -113,7 +141,12 @@ def check_for_install():
                 raise ValueError("缺少可用于浏览器试启动的普通账号，请准备 termlo-browser 系统账号。") from None
             with tempfile.TemporaryDirectory(prefix="termlo-browser-check-", dir="/tmp") as home:
                 os.chown(home, account.pw_uid, account.pw_gid)
-                return render_candidates(candidates(), account_prefix(account, home, probe=True))
+                try:
+                    return render_candidates(non_snap, account_prefix(account, home, probe=True))
+                except ValueError:
+                    if snap_paths:
+                        raise SnapProbeDeferred(snap_paths[0]) from None
+                    raise
         account = root_browser_account(False)
         return render_candidates(candidates(), account_prefix(account, account.pw_dir, probe=True))
     return check()

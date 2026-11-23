@@ -17,6 +17,9 @@ HEADER
 cat "$source_dir/python-runtime.sh" "$source_dir/prerequisites.sh" "$source_dir/doctor.sh" >> "$stage"
 printf "\nmanifest='%s'\n" "$(cat "$source_dir/mutagen-releases.txt")" >> "$stage"
 cat >> "$stage" <<'HEADER'
+system=$(uname -s 2>/dev/null) || system=''
+case $system in Darwin) PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" ;; *) PATH="$PATH:/usr/sbin:/sbin" ;; esac
+export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"
 scratch=''
 if has mktemp && has rm; then scratch=$(mktemp -d) || scratch=''; fi
 if [ -n "$scratch" ]; then trap 'rm -rf -- "$scratch"' EXIT; fi

@@ -451,6 +451,21 @@ class HostDetectionTests(unittest.TestCase):
             self.assertEqual(wizard.suggest_host(address)[0], str(address))
             self.assertEqual(wizard.suggest_host(None)[0], str(address))
 
+    def test_ipv4_nat_session_prefers_ipv4_address_over_ipv6(self):
+        private_v4 = termlo.ipaddress.ip_address("10.0.0.5")
+        client_v4 = termlo.ipaddress.ip_address("8.8.8.8")
+        public_v6 = termlo.ipaddress.ip_address("2606:4700:4700::1111")
+        public_v4 = termlo.ipaddress.ip_address("1.1.1.1")
+        with patch.object(sys, "platform", "linux"), \
+             patch.object(wizard, "local_addresses", return_value=[public_v6, public_v4]):
+            self.assertEqual(wizard.suggest_host(private_v4, client=client_v4)[0], str(public_v4))
+        with patch.object(sys, "platform", "linux"), \
+             patch.object(wizard, "local_addresses", return_value=[private_v4]), \
+             patch.object(wizard, "public_egress_address", return_value="1.1.1.1") as lookup:
+            self.assertEqual(wizard.suggest_host(private_v4, "global", "2606:4700:4700::1111", client=client_v4)[0],
+                             "1.1.1.1")
+            lookup.assert_called_once_with("global", ipv4_only=True)
+
 
 class BrowserTests(unittest.TestCase):
     def setUp(self):

@@ -176,18 +176,26 @@ package_available() (
                     output=$(microdnf --setopt="cachedir=$scratch/rpm" repoquery "$pkg" 2>/dev/null) &&
                         [ -n "$output" ] || return 1
                 elif ! "$manager" -q --setopt="cachedir=$scratch/rpm" --setopt="logdir=$scratch" \
-                        --setopt="persistdir=$scratch" list --available "$pkg" >/dev/null 2>&1; then
+                        --setopt="persistdir=$scratch" list --showduplicates --available "$pkg" >/dev/null 2>&1; then
                     # The installer enables EPEL on supported EL derivatives when base repos lack a tool.
-                    [ -r /etc/redhat-release ] && [ -r "$release" ] || return 1
+                    { [ -r /etc/redhat-release ] || [ -r /etc/alinux-release ] || [ -r /etc/anolis-release ]; } && [ -r "$release" ] || return 1
                     . "$release"
                     major=${VERSION_ID%%.*}
+                    case ${PLATFORM_ID:-} in
+                        platform:el[0-9]*|platform:al[0-9]*|platform:an[0-9]*)
+                            major=${PLATFORM_ID#platform:??}
+                            major=${major%%[^0-9]*} ;;
+                    esac
                     case $major in ''|*[!0-9]*) return 1 ;; esac
                     "$manager" -q --setopt="cachedir=$scratch/rpm" --setopt="logdir=$scratch" \
-                        --setopt="persistdir=$scratch" list --available epel-release >/dev/null 2>&1 || return 1
+                        --setopt="persistdir=$scratch" list --showduplicates --available epel-release >/dev/null 2>&1 ||
+                        { [ -r /etc/alinux-release ] && "$manager" -q --setopt="cachedir=$scratch/rpm" \
+                            --setopt="logdir=$scratch" --setopt="persistdir=$scratch" \
+                            list --showduplicates --available epel-aliyuncs-release >/dev/null 2>&1; } || return 1
                     "$manager" -q --setopt="cachedir=$scratch/rpm" --setopt="logdir=$scratch" \
                         --setopt="persistdir=$scratch" \
                         --repofrompath="termlo-epel,https://dl.fedoraproject.org/pub/epel/$major/Everything/\$basearch/" \
-                        list --available "$pkg" >/dev/null 2>&1 || return 1
+                        list --showduplicates --available "$pkg" >/dev/null 2>&1 || return 1
                 fi
             done ;;
         *) return 1 ;;
@@ -226,12 +234,28 @@ sys.exit(not correct_version(Path(sys.argv[2])))' "$payload" "$agent" 2>/dev/nul
         if [ -z "${TERMLO_MUTAGEN_ARCHIVE:-}" ]; then
             [ -n "$scratch" ] || { echo "请修复临时目录。$hint"; return 1; }
             api=https://api.github.com/repos/mutagen-io/mutagen/releases/assets/$asset
+            curl_status=0
             for source in "$url" "$api"; do
                 if curl -qfsSL --proto '=https' --proto-redir '=https' --connect-timeout 8 --max-time 180 \
-                        -H 'Accept: application/octet-stream' -o "$file" "$source" && archive_matches "$file" "$digest"; then
-                    printf 'Mutagen 安装包  官方 %s 的 SHA-256 已核对\n' "$version"; return 0
+                        -H 'Accept: application/octet-stream' -o "$file" "$source"; then
+                    if archive_matches "$file" "$digest"; then
+                        printf 'Mutagen 安装包  官方 %s 的 SHA-256 已核对\n' "$version"; return 0
+                    fi
+                    curl_status=0
+                else
+                    curl_status=$?
                 fi
             done
+            if [ "$curl_status" = 60 ] || [ "$curl_status" = 77 ]; then
+                case $family in
+                    apt|rpm|apk)
+                        ca_fix=$(package_hint ca-certificates ca-certificates ca-certificates '')
+                        echo "HTTPS 证书校验失败（curl 错误码 $curl_status）。请先核对系统时间、网络代理或安装系统根证书（$ca_fix），再重试；或者$hint" ;;
+                    *)
+                        echo "HTTPS 证书校验失败（curl 错误码 $curl_status）。请先核对系统时间、网络代理或系统根证书，再重试；或者$hint" ;;
+                esac
+                return 1
+            fi
         elif [ -f "$file" ] && [ -r "$file" ] && archive_matches "$file" "$digest"; then
             printf 'Mutagen 安装包  离线包 %s 的 SHA-256 已核对\n' "$version"; return 0
         fi
@@ -266,11 +290,20 @@ except (OSError, ValueError) as error: print(error, file=sys.stderr); sys.exit(4
 try:
     if not native_browser.executable(): sys.exit(3)
     print(native_browser.check_for_install())
+except native_browser.SnapProbeDeferred as deferred: print(deferred); sys.exit(5)
 except (OSError, ValueError) as error: sys.exit(str(error))' "$payload" 2>&1); then
         doctor_pass "远程浏览器  已渲染测试页  $browser"; return
     else status=$?; fi
     if [ "$status" = 4 ]; then
         doctor_block "远程浏览器运行账号  $browser" '运行 getent passwd termlo-browser 和 getent group termlo-browser 核对账号和组。请管理员处理同名冲突后再重试。'; return
+    fi
+    if [ "$status" = 5 ]; then
+        if [ ! -d /run/systemd/system ] && [ ! -S /run/snapd.socket ]; then
+            doctor_block '远程浏览器  当前 Ubuntu 无法启动 Snap' '请在有 systemd 的设备上启用 snapd.socket，或安装可实际启动的 Google Chrome 后重试。'
+        else
+            doctor_pass "远程浏览器  已安装 Snap，安装阶段创建专用账号后渲染核验  $browser"
+        fi
+        return
     fi
     ubuntu=0
     if [ "$family" = apt ] && ubuntu_release "$release"; then ubuntu=1; fi
@@ -515,6 +548,9 @@ ENDPOINT
             if [ "$previous_failures" = "$failed" ]; then
                 if package_available "$missing_base"; then doctor_pass "APT 组合安装  $missing_base 可一同安装"
                 else doctor_block "APT 组合安装  $missing_base 无法一同安装" "运行 apt-get -s --no-remove --reinstall install $missing_base 查看依赖错误，再用 apt-cache policy $missing_base 核对候选版本及软件源。修复后重试。"; fi
+                if [ -n "$scratch" ]; then
+                    for single in $missing_base; do rm -rf -- "$(apt_archive_group "$scratch" "$single")"; done
+                fi
             fi ;;
         esac
         doctor_browser
@@ -554,6 +590,25 @@ ENDPOINT
         if reason=$(check_sshd_config "$scratch" "$system" "$priv"); then
             doctor_pass 'SSH 服务配置  已检查，安装时生成缺少的主机密钥并启用服务'
         else doctor_block "SSH 服务配置无法通过检查  $reason" "请按上方提示核对配置文件和行号，然后运行 ${priv}sshd -t 复查。"; fi
+        if [ "$system" = Darwin ] && [ -x /usr/sbin/systemsetup ] &&
+                [ -n "$priv" ] && "${priv% }" -n true </dev/null >/dev/null 2>&1; then
+            mac_ssh=$(LC_ALL=C "${priv% }" -n /usr/sbin/systemsetup -getremotelogin 2>&1) || :
+            case $mac_ssh in
+                *'Full Disk Access'*)
+                    doctor_block 'macOS 远程登录  当前终端无权限开启远程登录' '请在「系统设置 → 通用 → 共享 → 远程登录」手动开启并允许当前账号登录，或授予当前终端「完全磁盘访问权限」后重试。' ;;
+            esac
+        fi
+    fi
+    if has sshd; then
+        user_name=$(id -un 2>/dev/null) || user_name=''
+        if policy_err=$(check_sshd_auth_policy "$scratch" "$priv" "$uid" "$user_name"); then :
+        else
+            policy_title=${policy_err%%'
+'*}
+            policy_fix=${policy_err#*'
+'}
+            doctor_block "SSH 公钥登录策略  $policy_title" "$policy_fix"
+        fi
     fi
     if [ "$full" = 1 ]; then printf '  Claude Code（选装）  %s\n' "$claude" >&2; fi
     if [ "$failed" -gt 0 ]; then

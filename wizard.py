@@ -64,16 +64,23 @@ def local_addresses():
     return addresses
 
 
-def public_egress_address(region="global"):
+def public_egress_address(region="global", *, ipv4_only=False, prefer_ipv4=False):
     domestic = "https://myip.ipip.net/json"
-    international = "https://api64.ipify.org"
-    for url in ((domestic, international) if region == "cn" else (international, domestic)):
+    ipv4_url = "https://api.ipify.org"
+    dual_url = "https://api64.ipify.org"
+    if ipv4_only:
+        urls = (domestic, ipv4_url) if region == "cn" else (ipv4_url, domestic)
+    elif prefer_ipv4:
+        urls = (domestic, ipv4_url, dual_url) if region == "cn" else (ipv4_url, domestic, dual_url)
+    else:
+        urls = (domestic, dual_url) if region == "cn" else (dual_url, domestic)
+    for url in urls:
         try:
             with urllib.request.urlopen(url, timeout=3) as response:
                 body = response.read(2048)
             value = json.loads(body)["data"]["ip"] if url == domestic else body.decode("ascii").strip()
             address = ipaddress.ip_address(value)
-            if address.is_global and usable_address(address):
+            if address.is_global and usable_address(address) and (not ipv4_only or address.version == 4):
                 return str(address)
         except (OSError, ValueError, KeyError, TypeError, http.client.HTTPException):
             continue
@@ -89,10 +96,20 @@ def suggest_host(ssh_address, region="global", egress=None, *, client=None):
     addresses = local_addresses()
     if sys.platform == "darwin" and addresses:
         return str(addresses[0]), "本机网络地址，跨网连接请核对"
-    for address in addresses:
-        if address.is_global:
-            return str(address), "本机公网地址"
-    external = egress or public_egress_address(region)
+    preferred_version = client.version if client else (ssh_address.version if ssh_address else None)
+    global_addresses = [address for address in addresses if address.is_global]
+    if preferred_version:
+        for address in global_addresses:
+            if address.version == preferred_version:
+                return str(address), "本机公网地址"
+    if global_addresses:
+        return str(global_addresses[0]), "本机公网地址"
+    external = egress
+    if external and preferred_version == 4 and ipaddress.ip_address(external).version != 4:
+        external = public_egress_address(region, ipv4_only=True) or external
+    elif not external:
+        external = (public_egress_address(region, prefer_ipv4=True) if preferred_version == 4
+                    else public_egress_address(region))
     if external:
         return external, "检测到的公网出口，使用转发时请核对"
     if ssh_address and usable_address(ssh_address):
