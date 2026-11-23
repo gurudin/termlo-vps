@@ -56,8 +56,9 @@ doctor_component() {
         case $names in '--cask '*) brew_cask=1 ;; *) brew_formula=1 ;; esac
     fi
     fix=$(package_hint "$@")
-    if [ "$family" = apt ] && [ "$manager_ok" = 1 ]; then
-        printf '  正在临时下载并校验 %s 软件包…\n' "$names" >&2
+    if [ "$manager_ok" = 1 ]; then
+        if [ "$family" = apt ]; then printf '  正在临时下载并校验 %s 软件包…\n' "$names" >&2
+        else printf '  正在核验 %s 软件源…\n' "$names" >&2; fi
     fi
     if [ "$manager_ok" = 1 ] && package_available "$names"; then
         doctor_pass "$label 安装来源  已确认 $names 可用，安装时补齐"
@@ -195,6 +196,10 @@ package_available() (
                     "$manager" -q --setopt="cachedir=$scratch/rpm" --setopt="logdir=$scratch" \
                         --setopt="persistdir=$scratch" \
                         --repofrompath="termlo-epel,https://dl.fedoraproject.org/pub/epel/$major/Everything/\$basearch/" \
+                        list --showduplicates --available "$pkg" >/dev/null 2>&1 ||
+                    "$manager" -q --setopt="cachedir=$scratch/rpm" --setopt="logdir=$scratch" \
+                        --setopt="persistdir=$scratch" \
+                        --repofrompath="termlo-epel-cn,https://mirrors.tuna.tsinghua.edu.cn/epel/$major/Everything/\$basearch/" \
                         list --showduplicates --available "$pkg" >/dev/null 2>&1 || return 1
                 fi
             done ;;
@@ -234,18 +239,40 @@ sys.exit(not correct_version(Path(sys.argv[2])))' "$payload" "$agent" 2>/dev/nul
         if [ -z "${TERMLO_MUTAGEN_ARCHIVE:-}" ]; then
             [ -n "$scratch" ] || { echo "请修复临时目录。$hint"; return 1; }
             api=https://api.github.com/repos/mutagen-io/mutagen/releases/assets/$asset
+            curl_flags='-qfsSL'
+            if [ -t 2 ] || [ "${interactive:-0}" = 1 ]; then curl_flags='-qfL'; fi
+            printf '  正在下载并校验 Mutagen %s 同步代理（约 100 MB）…\n' "$version" >&2
             curl_status=0
+            timed_out_partial=0
+            attempt=0
             for source in "$url" "$api"; do
-                if curl -qfsSL --proto '=https' --proto-redir '=https' --connect-timeout 8 --max-time 180 \
+                attempt=$((attempt + 1))
+                if [ "$attempt" = 2 ]; then
+                    printf '  主下载线路失败，正在通过 GitHub Releases API 重试…\n' >&2
+                fi
+                rm -f -- "$file"
+                if curl "$curl_flags" --proto '=https' --proto-redir '=https' --connect-timeout 8 --max-time 180 \
                         -H 'Accept: application/octet-stream' -o "$file" "$source"; then
+                    printf '  正在核对 Mutagen %s 安装包 SHA-256…\n' "$version" >&2
                     if archive_matches "$file" "$digest"; then
                         printf 'Mutagen 安装包  官方 %s 的 SHA-256 已核对\n' "$version"; return 0
                     fi
                     curl_status=0
                 else
                     curl_status=$?
+                    # If the transfer already connected and timed out mid-download, retrying
+                    # the GitHub API redirects to the same CDN and wastes another 3 minutes.
+                    if [ "$curl_status" = 28 ] && [ -s "$file" ]; then
+                        rm -f -- "$file"
+                        timed_out_partial=1
+                        break
+                    fi
                 fi
             done
+            if [ "$timed_out_partial" = 1 ]; then
+                echo "下载超时（GitHub 线路过慢，已停止重复等待）。$hint"
+                return 1
+            fi
             if [ "$curl_status" = 60 ] || [ "$curl_status" = 77 ]; then
                 case $family in
                     apt|rpm|apk)
@@ -284,6 +311,7 @@ doctor_browser() {
     if [ -z "$py" ]; then
         doctor_block '远程浏览器  缺少 Python，无法核验' "$(package_hint python3 python3.11 python3 python)"; return
     fi
+    printf '  正在核验远程浏览器…\n' >&2
     if browser=$("$py" -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import native_browser
 try: native_browser.check_install_account()
 except (OSError, ValueError) as error: print(error, file=sys.stderr); sys.exit(4)

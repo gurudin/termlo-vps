@@ -631,8 +631,27 @@ esac''')
         command(self.home / "bin/curl", '[ "$1" = --version ] || exit 60')
         result = self.run_installer("--check", "--sync-only")
         self.assert_checklist(result)
+        self.assertIn("正在下载并校验 Mutagen", result.stderr)
         self.assertIn("ca-certificates", result.stderr)
         self.assertIn("curl 错误码 60", result.stderr)
+
+    def test_mutagen_partial_timeout_does_not_retry_slow_cdn(self):
+        (self.home / ".mutagen/agents/0.18.1/mutagen-agent").unlink()
+        command(self.home / "bin/curl", '''
+[ "$1" != --version ] || exit 0
+echo call >> "$HOME/curl-calls"
+out=''
+prev=''
+for arg do
+    if [ "$prev" = -o ]; then out=$arg; fi
+    prev=$arg
+done
+[ -z "$out" ] || printf partial > "$out"
+exit 28''')
+        result = self.run_installer("--check", "--sync-only")
+        self.assert_checklist(result)
+        self.assertIn("下载超时（GitHub 线路过慢", result.stderr)
+        self.assertEqual(len((self.home / "curl-calls").read_text().splitlines()), 1)
 
     def test_rpm_preflight_uses_showduplicates_for_reinstall_candidates(self):
         tools = self.home / "bin"
