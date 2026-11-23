@@ -71,7 +71,7 @@ def install(verified_archive=None):
             archive = Path(local)
         else:
             download = ["curl", "-q", "--proto", "=https", "--proto-redir", "=https", "-fL", "--retry", "2",
-                        "--connect-timeout", "8", "--max-time", "600", "-o", str(archive)]
+                        "--connect-timeout", "10", "--speed-time", "30", "--speed-limit", "1024", "-o", str(archive)]
             first = subprocess.run([*download, url], stdout=sys.stderr)
             if first.returncode:
                 print("正在通过 GitHub Releases API 重试同一个官方同步包…", file=sys.stderr, flush=True)

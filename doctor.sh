@@ -243,15 +243,16 @@ sys.exit(not correct_version(Path(sys.argv[2])))' "$payload" "$agent" 2>/dev/nul
             if [ -t 2 ] || [ "${interactive:-0}" = 1 ]; then curl_flags='-qfL'; fi
             printf '  正在下载并校验 Mutagen %s 同步代理（约 100 MB）…\n' "$version" >&2
             curl_status=0
-            timed_out_partial=0
+            stalled=0
             attempt=0
             for source in "$url" "$api"; do
                 attempt=$((attempt + 1))
                 if [ "$attempt" = 2 ]; then
-                    printf '  主下载线路失败，正在通过 GitHub Releases API 重试…\n' >&2
+                    printf '  主下载线路中断或停滞，正在通过 GitHub Releases API 重试…\n' >&2
                 fi
                 rm -f -- "$file"
-                if curl "$curl_flags" --proto '=https' --proto-redir '=https' --connect-timeout 8 --max-time 180 \
+                if curl "$curl_flags" --proto '=https' --proto-redir '=https' --connect-timeout 10 \
+                        --speed-time 30 --speed-limit 1024 \
                         -H 'Accept: application/octet-stream' -o "$file" "$source"; then
                     printf '  正在核对 Mutagen %s 安装包 SHA-256…\n' "$version" >&2
                     if archive_matches "$file" "$digest"; then
@@ -260,17 +261,14 @@ sys.exit(not correct_version(Path(sys.argv[2])))' "$payload" "$agent" 2>/dev/nul
                     curl_status=0
                 else
                     curl_status=$?
-                    # If the transfer already connected and timed out mid-download, retrying
-                    # the GitHub API redirects to the same CDN and wastes another 3 minutes.
                     if [ "$curl_status" = 28 ] && [ -s "$file" ]; then
-                        rm -f -- "$file"
-                        timed_out_partial=1
-                        break
+                        stalled=1
                     fi
+                    rm -f -- "$file"
                 fi
             done
-            if [ "$timed_out_partial" = 1 ]; then
-                echo "下载超时（GitHub 线路过慢，已停止重复等待）。$hint"
+            if [ "$stalled" = 1 ]; then
+                echo "下载停滞超时（连续 30 秒几乎无数据传输）。$hint"
                 return 1
             fi
             if [ "$curl_status" = 60 ] || [ "$curl_status" = 77 ]; then
