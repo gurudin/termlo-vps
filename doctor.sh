@@ -34,6 +34,9 @@ doctor_component() {
     case $family in
         apt) names=$1 ;; rpm) names=$2 ;; apk) names=$3 ;; brew) names=$4 ;; *) names=$1 ;;
     esac
+    if [ "$family" = brew ]; then
+        case $names in '--cask '*) brew_cask=1 ;; *) brew_formula=1 ;; esac
+    fi
     fix=$(package_hint "$@")
     if [ "$manager_ok" = 1 ] && package_available "$names"; then
         doctor_pass "$label 安装来源  已确认 $names 可用，安装时补齐"
@@ -42,12 +45,38 @@ doctor_component() {
     fi
 }
 
+apt_packages_available() (
+    if apt-get -s --no-remove --no-install-recommends install "$@" >/dev/null 2>&1; then return 0; fi
+    # Minimal images can have empty indexes. Resolve against temporary lists;
+    # do not update the host's APT state or run its post-update hooks.
+    [ -n "$scratch" ] && has mkdir || return 1
+    if [ ! -d "$scratch/apt-lists" ]; then
+        mkdir -p "$scratch/apt-lists/partial" || return 1
+        cat > "$scratch/apt.conf" <<'APT'
+#clear APT::Update::Pre-Invoke;
+#clear APT::Update::Post-Invoke;
+#clear APT::Update::Post-Invoke-Success;
+Dir::Cache::pkgcache "";
+Dir::Cache::srcpkgcache "";
+APT::Update::Error-Mode "any";
+Acquire::http::Timeout "8";
+Acquire::https::Timeout "8";
+APT
+        if apt-get -c "$scratch/apt.conf" -o "Dir::State::lists=$scratch/apt-lists" update >/dev/null 2>&1; then
+            : > "$scratch/apt-ready"
+        fi
+    fi
+    [ -f "$scratch/apt-ready" ] &&
+        apt-get -s -c "$scratch/apt.conf" -o "Dir::State::lists=$scratch/apt-lists" \
+            --no-remove --no-install-recommends install "$@" >/dev/null 2>&1
+)
+
 package_available() (
     # Names and options come exclusively from doctor_component's fixed package lists.
     set -f
     set -- $1
     case $family in
-        apt) apt-get -s --no-remove --no-install-recommends install "$@" >/dev/null 2>&1 ;;
+        apt) apt_packages_available "$@" ;;
         apk) apk --no-cache --simulate add "$@" >/dev/null 2>&1 ;;
         brew)
             HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 "$@" >/dev/null 2>&1 ;;
@@ -90,7 +119,7 @@ check_agent() (
         name=mutagen_${target}_v$version.tar.gz
         url=https://github.com/mutagen-io/mutagen/releases/download/v$version/$name
         file=${TERMLO_MUTAGEN_ARCHIVE:-$scratch/agent.tar.gz}
-        hint="请在可联网设备运行 curl -fL -o $name $url，把文件放到远端后设置 export TERMLO_MUTAGEN_ARCHIVE=\"\$PWD/$name\"。"
+        hint="请在可联网设备运行 curl -fL -o $name ${url}，把文件放到远端后设置 export TERMLO_MUTAGEN_ARCHIVE=\"\$PWD/$name\"。"
         if [ -z "${TERMLO_MUTAGEN_ARCHIVE:-}" ]; then
             [ -n "$scratch" ] || { echo "请修复临时目录。$hint"; return 1; }
             api=https://api.github.com/repos/mutagen-io/mutagen/releases/assets/$asset
@@ -144,7 +173,7 @@ except (OSError, ValueError) as error: sys.exit(str(error))' "$payload" 2>&1); t
     if [ "$family" = apt ] && [ -r "$release" ] && ( . "$release"; [ "${ID:-}" = ubuntu ] ); then ubuntu=1; fi
     if [ "$ubuntu" = 1 ]; then fix="${priv}apt-get update && ${priv}apt-get install -y snapd && ${priv}systemctl enable --now snapd.socket && ${priv}snap install chromium"
     else fix=$(package_hint 'chromium chromium-sandbox' chromium chromium '--cask google-chrome'); fi
-    if [ "$status" != 3 ]; then doctor_block "远程浏览器  $browser" "$fix；按上面的错误修复后重试。"; return; fi
+    if [ "$status" != 3 ]; then doctor_block "远程浏览器  $browser" "${fix}；按上面的错误修复后重试。"; return; fi
     if [ "$ubuntu" = 0 ]; then
         doctor_component '远程浏览器 Chromium' 'chromium chromium-sandbox' chromium chromium '--cask google-chrome'
     elif [ ! -d /run/systemd/system ] && [ ! -S /run/snapd.socket ]; then
@@ -158,13 +187,13 @@ except (OSError, ValueError) as error: sys.exit(str(error))' "$payload" 2>&1); t
 }
 
 termlo_doctor() (
-    payload=$1; manifest=$2; release=$3; scratch=$4; shift 4
+    payload=$1; manifest=$2; release=$3; scratch=$4; interactive=$5; shift 5
     system=$(uname -s) || system=未知
     machine=$(uname -m) || machine=未知
     passed=0; failed=0; packages_needed=0; admin_needed=0; full=1; check_only=0
-    port=22; key=''; claude='安装时可选择'; manager=''; manager_ok=0
+    port=22; key=''; claude='安装时可选择'; manager=''; manager_ok=0; brew_formula=0; brew_cask=0
     printf '\nTermlo 安装前体检清单\n' >&2
-    if [ "$#" -eq 0 ]; then
+    if [ "$interactive" = 1 ]; then
         if ( : </dev/tty ) 2>/dev/null; then doctor_pass '交互终端  可用'
         else doctor_block '安装向导需要交互终端' '请在设备控制台或交互式 SSH 会话中运行安装命令。'; fi
     fi
@@ -237,6 +266,22 @@ termlo_doctor() (
     py=$(find_python) || py=''
     if [ -n "$py" ]; then doctor_pass "Python  $("$py" -V 2>&1)，TLS 和压缩模块可用"
     else doctor_block 'Python  需要 3.8 或更高版本且含 TLS 和压缩模块' "$(package_hint python3 python3.11 python3 python)"; fi
+    for record in connection.json installed-components.json; do
+        if [ ! -e "$config/$record" ] && [ ! -L "$config/$record" ]; then continue; fi
+        if [ -z "$payload" ] || [ -z "$py" ]; then
+            doctor_block "已有文件 $record 无法核验" '按清单先修复安装包或 Python，再重新检查。'
+        elif reason=$("$py" -IB -c 'import sys; sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+from termlo import saved_connection
+from uninstall import Receipt
+folder = Path(sys.argv[2])
+try:
+    if sys.argv[3] == "connection.json": saved_connection(folder / sys.argv[3])
+    else: Receipt(folder)
+except (OSError, ValueError) as error: sys.exit(str(error))' "$payload" "$config" "$record" 2>&1); then
+            doctor_pass "已有文件 $record  可读取"
+        else doctor_block "已有文件 $record 无法使用  $reason" "请检查 $config/$record 的内容、所有者和读写权限，然后重试。"; fi
+    done
     if curl --version >/dev/null 2>&1; then doctor_pass 'HTTPS 下载工具  curl'
     else doctor_block 'HTTPS 下载工具  curl 不可用' "$(package_hint 'curl ca-certificates' 'curl ca-certificates' 'curl ca-certificates' curl)"; fi
 
@@ -247,8 +292,8 @@ termlo_doctor() (
     missing=''
     for tool in ssh scp ssh-keygen ssh-keyscan; do has "$tool" || missing="$missing $tool"; done
     if [ -z "$missing" ]; then doctor_pass 'SSH 客户端工具  ssh、scp、ssh-keygen、ssh-keyscan'
-    elif [ -n "${SSH_CONNECTION:-}$key" ]; then doctor_block "SSH 客户端工具  缺少$missing，无法核验现有连接" "$ssh_fix"
-    else doctor_component "SSH 客户端工具（缺少$missing）" openssh-client openssh-clients 'openssh-client-default openssh-keygen' openssh; fi
+    elif [ -n "${SSH_CONNECTION:-}$key" ]; then doctor_block "SSH 客户端工具  缺少${missing}，无法核验现有连接" "$ssh_fix"
+    else doctor_component "SSH 客户端工具（缺少${missing}）" openssh-client openssh-clients 'openssh-client-default openssh-keygen' openssh; fi
 
     case "$port" in ''|*[!0-9]*) valid_port=0 ;; *) valid_port=$port ;; esac
     if ! { [ "$valid_port" -gt 0 ] && [ "$valid_port" -le 65535 ]; } 2>/dev/null; then
@@ -293,6 +338,15 @@ ENDPOINT
         if [ "$packages_needed" = 1 ] || [ -z "$py" ]; then
             doctor_block '系统包管理器  缺少可用的 Homebrew' '运行 Homebrew 官方安装命令后按终端提示配置 PATH：/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
         else doctor_pass '系统包管理器  当前组件均可复用，无需调用 Homebrew'; fi
+    fi
+    if [ "$brew_formula" = 1 ] && [ "$manager_ok" = 1 ]; then
+        if cellar=$(brew --cellar) && writable_directory "$cellar"; then doctor_pass 'Homebrew 软件安装目录  可写入'
+        else doctor_block 'Homebrew 软件安装目录不可写' '请使用拥有 Homebrew 安装目录权限的账号补齐上述软件，再回到当前 SSH 账号重试。'; fi
+    fi
+    if [ "$brew_cask" = 1 ] && [ "$manager_ok" = 1 ]; then
+        if caskroom=$(brew --caskroom) && writable_directory "$caskroom" && writable_directory "$HOME/Applications"; then
+            doctor_pass 'Homebrew 应用安装目录  可写入'
+        else doctor_block 'Homebrew 应用安装目录不可写' '请确认 brew --caskroom 指向的目录和 ~/Applications 均可写，或请管理员安装清单中缺少的应用。'; fi
     fi
     if [ "$packages_needed" = 1 ] && [ "$family" != brew ]; then admin_needed=1; fi
     if [ "$admin_needed" = 0 ]; then doctor_pass '安装权限  本次无需系统提权'

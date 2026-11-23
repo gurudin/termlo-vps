@@ -1,6 +1,7 @@
 """Exercise the actual single-file installer before granting it any system changes."""
 import os
 import re
+import shutil
 import subprocess
 import sys
 import unittest
@@ -65,7 +66,9 @@ class DoctorTests(unittest.TestCase):
         rows = re.findall(r"^  \[(通过|未通过)\] .+$", result.stderr, re.M)
         self.assertTrue(rows, result.stderr)
         failed = rows.count("未通过")
-        self.assertEqual(result.stderr.count("补齐方法  "), failed)
+        remedies = re.findall(r"^           补齐方法  (.*)$", result.stderr, re.M)
+        self.assertEqual(len(remedies), failed)
+        self.assertTrue(all(hint.strip() for hint in remedies), result.stderr)
         if failed:
             self.assertIn(f"{len(rows)-failed} 项通过，{failed} 项未通过", result.stderr)
             self.assertNotEqual(result.returncode, 0)
@@ -102,6 +105,40 @@ class DoctorTests(unittest.TestCase):
         self.assertFalse((self.home / ".local").exists())
         self.assertFalse((self.home / ".ssh").exists())
 
+    def test_existing_invalid_connection_and_receipt_reported_together_without_overwriting_them(self):
+        config = self.home / "config/termlo"
+        connection = config / "connection.json"
+        receipt = config / "installed-components.json"
+        connection.write_text("[]")
+        receipt.write_text("{")
+        result = self.run_installer("--without-claude")
+        self.assert_checklist(result)
+        for path in (connection, receipt):
+            self.assertIn("[未通过] 已有文件 " + path.name, result.stderr)
+        self.assertEqual(connection.read_text(), "[]")
+        self.assertEqual(receipt.read_text(), "{")
+        self.assertFalse((config / "install.lock").exists())
+
+    def test_empty_apt_indexes_are_resolved_in_private_storage(self):
+        tools = self.home / "bin"
+        (tools / "tmux").unlink()
+        (tools / "mkdir").symlink_to(shutil.which("mkdir"))
+        command(tools / "sudo", '[ "$1 $2" = "-n true" ]')
+        command(tools / "apt-get", '''
+[ "$1" != --version ] || exit 0
+echo "$*" >> "$HOME/apt-calls"
+case "$*" in
+    *Dir::State::lists="$HOME"/*/apt-lists*) exit 0 ;;
+    *) exit 1 ;;
+esac''')
+        result = self.run_installer("--check")
+        self.assert_checklist(result)
+        self.assertIn("[通过] tmux 安装来源", result.stderr)
+        calls = (self.home / "apt-calls").read_text().splitlines()
+        self.assertEqual(sum(line.endswith(" update") for line in calls), 1)
+        self.assertTrue(all(line.startswith("-s ") or line.endswith(" update") for line in calls))
+        self.assertFalse((self.home / ".local").exists())
+
     def test_browser_falls_back_to_a_working_candidate_after_render_failure(self):
         bad = self.home / "bin/chromium"
         good = self.home / "bin/google-chrome"
@@ -113,6 +150,16 @@ class DoctorTests(unittest.TestCase):
         checked = self.run_installer("--check")
         self.assertEqual(checked.returncode, 0, checked.stderr)
         self.assertIn("已渲染测试页  " + str(good), checked.stderr)
+
+    def test_utf8_shell_prints_the_offline_repair_command_when_download_fails(self):
+        self.env["LC_ALL"] = "en_US.UTF-8" if sys.platform == "darwin" else "C.UTF-8"
+        (self.home / ".mutagen/agents/0.18.1/mutagen-agent").unlink()
+        command(self.home / "bin/curl", '[ "$1" = --version ] || exit 6')
+        result = self.run_installer("--check")
+        self.assert_checklist(result)
+        self.assertIn("curl -fL -o mutagen_linux_amd64_v0.18.1.tar.gz https://github.com/", result.stderr)
+        self.assertIn("export TERMLO_MUTAGEN_ARCHIVE=", result.stderr)
+        self.assertNotIn("unbound variable", result.stderr)
 
     def test_public_command_does_not_run_a_partial_or_stale_file_after_a_failed_download(self):
         installer = self.home / "install.sh"

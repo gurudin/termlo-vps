@@ -19,7 +19,9 @@ case ${1:-} in
 esac
 scratch=$(mktemp -d) || scratch=''
 if [ -n "$scratch" ]; then trap 'rm -rf -- "$scratch"' EXIT; fi
-termlo_doctor "$source_dir" "$(cat "$source_dir/mutagen-releases.txt")" /etc/os-release "$scratch" "$@"
+interactive=0
+if [ "$#" = 0 ]; then interactive=1; fi
+termlo_doctor "$source_dir" "$(cat "$source_dir/mutagen-releases.txt")" /etc/os-release "$scratch" "$interactive" "$@"
 for arg do [ "$arg" != --check ] || exit 0; done
 if [ "$#" = 0 ]; then exec </dev/tty; fi
 if [ -f "$scratch/agent.tar.gz" ]; then export TERMLO_MUTAGEN_ARCHIVE="$scratch/agent.tar.gz"; fi

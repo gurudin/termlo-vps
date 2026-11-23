@@ -20,7 +20,9 @@ cat >> "$stage" <<'HEADER'
 scratch=''
 if has mktemp && has rm; then scratch=$(mktemp -d) || scratch=''; fi
 if [ -n "$scratch" ]; then trap 'rm -rf -- "$scratch"' EXIT; fi
-termlo_doctor '' "$manifest" /etc/os-release "$scratch" "$@"
+interactive=0
+if [ "$#" = 0 ]; then interactive=1; fi
+termlo_doctor '' "$manifest" /etc/os-release "$scratch" "$interactive" "$@"
 )
 termlo_install() (
 unpack_missing=''

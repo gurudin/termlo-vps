@@ -99,9 +99,25 @@ def verified_identity(settings, packages=None, *, require_key=False):
                               public_key=preferred, include_host_key=True)
 
 
+def saved_connection(path):
+    if not os.path.lexists(path):
+        return {}
+    if not path.is_file():
+        raise ValueError("connection.json 需要是可读的普通文件")
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(saved, dict):
+        raise ValueError("connection.json 需要是 JSON 对象")
+    for field in ("host", "name", "host_key"):
+        if saved.get(field) is not None and not isinstance(saved[field], str):
+            raise ValueError(f"connection.json 的 {field} 需要是文本")
+    for field in ("port", "local_port"):
+        if saved.get(field) is not None:
+            saved[field] = wizard.ssh_port(str(saved[field]))
+    return saved
+
+
 def connection_settings(args, terminal=None, region="global", egress=None):
-    path = config_dir() / "connection.json"
-    saved = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    saved = saved_connection(config_dir() / "connection.json")
     address, internal_port = ssh_endpoint()
     user = pwd.getpwuid(os.getuid()).pw_name
     host = args.host if args.host is not None else saved.get("host")
@@ -359,7 +375,8 @@ def install_in_directory(args, terminal, checked, interactive, state):
             flags.append("--check")
         check_script = helper_source("python-runtime.sh", "prerequisites.sh", "doctor.sh") + b'\ntermlo_doctor "$@"\n'
         check_result = subprocess.run(["/bin/sh", "-s", "--", str(Path(__file__).parent),
-                                       helper_source("mutagen-releases.txt").decode(), str(OS_RELEASE), state, *flags],
+                                       helper_source("mutagen-releases.txt").decode(), str(OS_RELEASE), state,
+                                       str(int(interactive)), *flags],
                                       input=check_script)
         if check_result.returncode:
             raise ValueError("安装前体检未通过。")
@@ -390,8 +407,8 @@ def install_in_directory(args, terminal, checked, interactive, state):
             subprocess.run(["curl", "--version"], stdout=subprocess.DEVNULL, check=True)
         note(f"正在准备 Mutagen {sync_agent.VERSION} 远端同步代理…")
         checked_archive = Path(state) / "agent.tar.gz"
-        agent = packages.with_https_repair(lambda: receipt.install_agent(checked_archive) if checked_archive.is_file()
-                                           else receipt.install_agent())
+        archive = checked_archive if checked_archive.is_file() else None
+        agent = packages.with_https_repair(lambda: receipt.install_agent(archive))
         note(f"双向同步的远端代理已就绪：{agent}")
         if not args.sync_only:
             ensure_base_tools(packages)
