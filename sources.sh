@@ -98,10 +98,7 @@ install_rpm() {
     local state=$1 manager name group
     shift
     local missing=() repair=()
-    for manager in dnf yum microdnf; do
-        command -v "$manager" >/dev/null && break
-    done
-    command -v "$manager" >/dev/null || { echo "此 RPM 系统没有可执行的 dnf、yum 或 microdnf。" >&2; return 1; }
+    manager=$(rpm_manager) || { echo "此 RPM 系统没有可用的 dnf、yum 或 microdnf。" >&2; return 1; }
     for name in "$@"; do
         if rpm -q "$name" >/dev/null 2>&1; then repair+=("$name"); else missing+=("$name"); fi
     done

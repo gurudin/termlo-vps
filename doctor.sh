@@ -267,24 +267,15 @@ except (OSError, ValueError) as error: sys.exit(str(error))' "$payload" 2>&1); t
     else doctor_block '远程浏览器安装来源  无法验证 Chromium 的 Snap 安装包' "$fix"; fi
 }
 
-termlo_doctor() (
-    payload=$1; manifest=$2; release=$3; scratch=$4; interactive=$5; shift 5
-    system=$(uname -s) || system=未知
-    machine=$(uname -m) || machine=未知
-    passed=0; failed=0; packages_needed=0; admin_needed=0; full=1; check_only=0
-    port=22; key=''; claude='安装时可选择'; manager=''; manager_ok=0; brew_formula=0; brew_cask=0
-    printf '\nTermlo 安装前体检清单\n' >&2
-    if [ "$interactive" = 1 ]; then
-        if ( : </dev/tty ) 2>/dev/null; then doctor_pass '交互终端  可用'
-        else doctor_block '安装向导需要交互终端' '请在设备控制台或交互式 SSH 会话中运行安装命令。'; fi
-    fi
+doctor_arguments() {
     while [ "$#" -gt 0 ]; do
         case $1 in
             --check) check_only=1 ;;
             --sync-only) full=0 ;;
             --with-claude) claude='已选择安装' ;; --without-claude) claude='已选择跳过' ;;
             --port|--host-key|--host|--name)
-                if [ "$#" -lt 2 ]; then doctor_block "安装参数 $1 缺少值" '补齐参数或运行原安装命令。'; break; fi
+                if [ "$#" -lt 2 ]; then doctor_block "安装参数 $1 缺少值" '请补齐这个参数的值，或运行原安装命令。'; break; fi
+                case $2 in --*) doctor_block "安装参数 $1 缺少值" '请补齐这个参数的值，或运行原安装命令。'; shift; continue ;; esac
                 case $1 in --port) port=$2 ;; --host-key) key=$2 ;; esac
                 shift ;;
             --port=*) port=${1#*=} ;; --host-key=*) key=${1#*=} ;; --name=*|--host=*) ;;
@@ -292,6 +283,21 @@ termlo_doctor() (
         esac
         shift
     done
+}
+
+termlo_doctor() (
+    payload=$1; manifest=$2; release=$3; scratch=$4; interactive=$5; shift 5
+    system=$(uname -s 2>/dev/null) || system=未知
+    machine=$(uname -m 2>/dev/null) || machine=未知
+    passed=0; failed=0; packages_needed=0; admin_needed=0; full=1; check_only=0
+    port=22; key=''; claude='安装时可选择'; manager=''; manager_ok=0; brew_formula=0; brew_cask=0
+    printf '\nTermlo 安装前体检清单\n' >&2
+    doctor_arguments "$@"
+    argument_errors=$failed
+    if [ "$interactive" = 1 ]; then
+        if ( : </dev/tty ) 2>/dev/null; then doctor_pass '交互终端  可用'
+        else doctor_block '安装向导需要交互终端' '请在设备控制台或交互式 SSH 会话中运行安装命令。'; fi
+    fi
     case "$system/$machine" in Linux/x86_64|Linux/aarch64|Linux/arm64|Darwin/x86_64|Darwin/arm64)
         doctor_pass "远程系统  $system $machine" ;;
         未知/*|*/未知) doctor_block '远程系统  无法取得系统或处理器型号' '请恢复 uname 工具或系统 PATH，确认 uname -s 和 uname -m 都能输出结果。' ;;
@@ -335,10 +341,7 @@ termlo_doctor() (
             if apk --version >/dev/null 2>&1; then manager_ok=1; doctor_pass '系统包管理器  apk'
             else doctor_block '系统包管理器  apk 不可用' '请从对应版本的 Alpine 安装介质恢复 apk-tools。'; fi ;;
         rpm)
-            for tool in dnf yum microdnf; do
-                if "$tool" --version >/dev/null 2>&1; then manager=$tool; break; fi
-            done
-            if [ -n "$manager" ]; then manager_ok=1; doctor_pass "系统包管理器  $manager"
+            if manager=$(rpm_manager); then manager_ok=1; doctor_pass "系统包管理器  $manager"
             else doctor_block '系统包管理器  DNF/YUM 不可用' "请从同版本发行版取得管理器及其依赖的 RPM，在该目录运行 ${priv}rpm -Uvh --replacepkgs ./*.rpm。"; fi ;;
         brew) if brew --version >/dev/null 2>&1; then manager_ok=1; doctor_pass '系统包管理器  Homebrew'; fi ;;
         *) doctor_block '无法识别系统包管理器' '请使用 Debian/Ubuntu、RPM 系、Alpine Linux 或 macOS 安装。' ;;
@@ -351,6 +354,7 @@ termlo_doctor() (
     doctor_account_file '安装锁文件' "$config/install.lock" lock
     doctor_account_file 'SSH 配对锁文件' "$HOME/.ssh/.termlo-pair.lock" lock
     doctor_account_file 'SSH 授权文件' "$HOME/.ssh/authorized_keys" keys
+    connection_ok=1
     for record in connection.json installed-components.json; do
         if [ ! -e "$config/$record" ] && [ ! -L "$config/$record" ]; then continue; fi
         if [ -z "$payload" ] || [ -z "$py" ]; then
@@ -365,8 +369,22 @@ try:
     else: Receipt(folder)
 except (OSError, ValueError) as error: sys.exit(str(error))' "$payload" "$config" "$record" 2>&1); then
             doctor_pass "已有文件 $record  可读取"
-        else doctor_block "已有文件 $record 无法使用  $reason" "请检查 $config/$record 的内容、所有者和读写权限，然后重试。"; fi
+        else
+            doctor_block "已有文件 $record 无法使用  $reason" "请检查 $config/$record 的内容、所有者和读写权限，然后重试。"
+            if [ "$record" = connection.json ]; then connection_ok=0; fi
+        fi
     done
+    listen_port=$port
+    if [ "$argument_errors" = 0 ] && [ "$connection_ok" = 1 ] && [ -n "$py" ] && [ -n "$payload" ]; then
+        if resolved=$("$py" -IB -c 'import sys; sys.path.insert(0, sys.argv[1])
+from termlo import preflight_port
+try: print(preflight_port(sys.argv[3:], sys.argv[2]))
+except (OSError, ValueError, RuntimeError) as error: sys.exit(str(error))' "$payload" "$interactive" "$@" 2>&1); then
+            listen_port=$resolved
+            doctor_pass 'SSH 连接参数  可用于本次安装'
+        else doctor_block 'SSH 连接参数无法使用' "$resolved
+             请修正上方参数，或直接运行原安装命令进入向导。"; fi
+    fi
     if curl --version >/dev/null 2>&1; then doctor_pass 'HTTPS 下载工具  curl'
     else doctor_block 'HTTPS 下载工具  curl 不可用' "$(package_hint 'curl ca-certificates' 'curl ca-certificates' 'curl ca-certificates' curl)"; fi
 
@@ -401,8 +419,10 @@ except (OSError, ValueError) as error: sys.exit(str(error))' "$payload" "$config
     case "$port" in ''|*[!0-9]*) valid_port=0 ;; *) valid_port=$port ;; esac
     if ! { [ "$valid_port" -gt 0 ] && [ "$valid_port" -le 65535 ]; } 2>/dev/null; then
         doctor_block 'SSH 端口超出范围' '请将 SSH 端口设置为 1 到 65535 之间的实际端口。'
-    elif keys=$(scan_ssh "$port"); then
-        doctor_pass 'SSH 服务及主机密钥  已从本机 SSH 端口取得公钥'
+    elif keys=$(scan_ssh "$listen_port"); then
+        if [ -n "$scratch" ] && ! printf '%s\n' "${keys%% *}" > "$scratch/ssh-port"; then
+            doctor_block 'SSH 监听端口无法记录' '请检查临时目录的可用空间和写权限。'
+        else doctor_pass 'SSH 服务及主机密钥  已从本机 SSH 端口取得公钥'; fi
     elif [ -n "${SSH_CONNECTION:-}" ]; then
         read -r client client_port address internal_port <<ENDPOINT
 $SSH_CONNECTION
@@ -417,7 +437,8 @@ ENDPOINT
         else doctor_pass 'SSH 服务配置工具  可在安装阶段生成主机密钥并启动服务'; fi
     fi
     if [ -n "$key" ]; then
-        if [ -r "$key" ] && ssh-keygen -lf "$key" >/dev/null 2>&1; then
+        case $key in '~/'*) key=$HOME/${key#\~/} ;; esac
+        if [ -f "$key" ] && [ -r "$key" ] && ssh-keygen -lf "$key" >/dev/null 2>&1; then
             read -r kind blob rest < "$key" || :
             case "${keys:-} " in *" $kind $blob "*|*" $kind $blob
 "*) doctor_pass '指定 SSH 公钥  与服务一致' ;;

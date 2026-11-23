@@ -121,6 +121,15 @@ esac''')
         self.assertEqual(self.apt("cn").returncode, 0)
         self.assertNotIn("cn", self.log.read_text())
 
+    def test_rpm_install_uses_the_executable_that_passes_the_checklist(self):
+        command(self.folder / "dnf", "exit 127")
+        command(self.folder / "yum", 'echo "$*" >> "$LOG"')
+        command(self.folder / "rpm", "exit 1")
+        run = subprocess.run(["bash", self.script, "linux", "rpm", "global", str(self.folder), "tmux"],
+                             env=self.env, capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("install tmux", self.log.read_text())
+
     def test_detected_address_is_validated_and_reused_only_after_local_addresses(self):
         with patch.dict(os.environ, TERMLO_INSTALL_NETWORK="cn 8.8.8.8"), \
              patch.object(wizard, "local_addresses", return_value=[]), \

@@ -1,7 +1,7 @@
 """Termlo 远程开发环境安装器和用户命令。"""
 
 import argparse
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 import fcntl
 import ipaddress
 import json
@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import pkgutil
 import pwd
+import shlex
 import shutil
 import ssl
 import subprocess
@@ -23,7 +24,7 @@ import pairing
 import sync_agent
 import uninstall
 import wizard
-from connection_code import connection_details, encode, validate_host
+from connection_code import connection_details, encode, validate_host, validate_user
 
 
 OS_RELEASE = Path("/etc/os-release")
@@ -83,8 +84,12 @@ def verified_identity(settings, packages=None, *, require_key=False):
     key_file = settings.get("host_key")
     preferred = None
     if key_file:
-        with Path(key_file).open(encoding="utf-8") as source:
-            preferred = " ".join(source.readline().split()[:2])
+        try:
+            with Path(key_file).open("rb") as source:
+                preferred = b" ".join(source.readline().split()[:2]).decode("ascii")
+        except (OSError, UnicodeError) as error:
+            if require_key:
+                raise ValueError("无法读取指定的 SSH 主机公钥，请核对 --host-key。") from error
         if preferred not in accepted:
             if require_key:
                 raise ValueError("指定的 SSH 主机公钥与服务实际提供的密钥不符。请核对 --host-key 与监听端口。")
@@ -95,6 +100,8 @@ def verified_identity(settings, packages=None, *, require_key=False):
     if not preferred:
         raise ValueError("SSH 服务没有提供可验证的主机公钥。")
     settings["local_port"] = accepted[preferred]
+    if settings["port"] is None:
+        settings["port"] = settings["local_port"]
     return connection_details(settings["host"], settings["port"], settings["user"], name=settings["name"],
                               public_key=preferred, include_host_key=True)
 
@@ -122,12 +129,17 @@ def saved_connection(path):
     return saved
 
 
-def connection_settings(args, terminal=None, region="global", egress=None):
+def connection_settings(args, terminal=None, region="global", egress=None, *, prompt_later=False, detected_port=None):
     saved = saved_connection(config_dir() / "connection.json")
     address, internal_port = ssh_endpoint()
-    user = pwd.getpwuid(os.getuid()).pw_name
+    try:
+        user = pwd.getpwuid(os.getuid()).pw_name
+    except KeyError as error:
+        raise ValueError("请使用已登记的 SSH 登录账号运行安装命令。") from error
+    validate_user(user)
     host = args.host if args.host is not None else saved.get("host")
-    port = args.port if args.port is not None else saved.get("port", internal_port)
+    default_port = internal_port if address is not None else detected_port
+    port = args.port if args.port is not None else saved.get("port", default_port)
     if terminal is not None:
         note(f"\n1/3  确认 SSH 连接\n登录用户  {user}    按回车接受方括号中的默认值。")
         if host is None:
@@ -135,20 +147,28 @@ def connection_settings(args, terminal=None, region="global", egress=None):
         else:
             source = "指定地址" if args.host is not None else "上次使用的地址"
         host = wizard.ask_field(terminal, f"服务器地址（{source}）", host, wizard.ssh_host)
-        port = wizard.ask_field(terminal, "SSH 对外端口", port, wizard.ssh_port)
-    elif host is None:
+        if port is None:
+            port = wizard.ask_field(terminal, "SSH 对外端口", "自动识别",
+                                    lambda value: None if value == "自动识别" else wizard.ssh_port(value))
+        else:
+            port = wizard.ask_field(terminal, "SSH 对外端口", port, wizard.ssh_port)
+    elif host is None and not prompt_later:
         if address is None or not address.is_global or address.is_multicast:
             raise ValueError("请用 --host 指定 Mac 可访问的 VPS 域名或 IP。有端口映射时同时指定 --port。")
         host = str(address)
-    validate_host(host)
-    wizard.ssh_port(str(port))
+    if host is not None:
+        validate_host(host)
+    if port is not None:
+        wizard.ssh_port(str(port))
     key = args.host_key
+    if key == "":
+        raise ValueError("请填写 --host-key 的公钥路径，或省略此参数以自动识别。")
     if key is None and saved.get("host_key") and Path(saved["host_key"]).is_file():
         key = saved["host_key"]
     name = args.name if args.name is not None else saved.get("name")
     if name is not None and not name.strip():
         raise ValueError("服务器名称不能为空")
-    local_port = internal_port if address is not None else saved.get("local_port", port)
+    local_port = internal_port if address is not None else detected_port or saved.get("local_port", port or 22)
     return dict(host=host, port=port, user=user, name=name, local_port=local_port,
                 host_key=str(Path(key).expanduser().resolve()) if key else None)
 
@@ -339,17 +359,46 @@ def install_cli():
             shutil.copyfile(sys.argv[0], stage)
         else:
             with stage.open("wb") as output:
-                output.write(("#!" + sys.executable + "\n").encode())
+                output.write(b"#!/bin/sh\n")
+                output.write(helper_source("python-runtime.sh"))
+                candidates = (sys.executable, getattr(sys, "_base_executable", None))
+                preferred = " ".join(shlex.quote(p) for p in dict.fromkeys(candidates) if p)
+                output.write(("\npy=$(find_python " + preferred + ") || { "
+                              "echo 'Termlo 需要可用的 Python 3.8+，请重新运行安装命令检查环境。' >&2; exit 1; }\n"
+                              'exec "$py" -B "$0" "$@"\nexit 1\n').encode())
                 with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED, strict_timestamps=False) as bundle:
                     for name in ("termlo.py", "connection_code.py", "pairing.py", "browser.py", "native_browser.py",
                                  "sync_agent.py", "mutagen-releases.txt", "uninstall.py", "wizard.py", "sources.sh", "doctor.sh", "prerequisites.sh", "python-runtime.sh"):
                         bundle.write(Path(__file__).with_name(name), name)
                     bundle.writestr("__main__.py", "from termlo import main\nmain()\n")
         stage.chmod(0o755)
+        subprocess.run([str(stage), "--help"], check=True, stdout=subprocess.DEVNULL)
         os.replace(stage, target)
     finally:
         if stage.exists():
             stage.unlink()
+
+
+def publish_connection(folder, settings, details):
+    target = folder / "connection.json"
+    with tempfile.TemporaryDirectory(dir=folder) as temporary:
+        previous = Path(temporary) / "previous"
+        if os.path.lexists(target):
+            shutil.copy2(target, previous, follow_symlinks=False)
+        with tempfile.NamedTemporaryFile(dir=temporary, mode="w", encoding="utf-8", delete=False) as staged:
+            json.dump(settings, staged, ensure_ascii=False)
+        with pairing.locked_authorized_keys() as keys, pairing.pending_invitation(keys) as invitation:
+            code = encode(dict(details, version=2, pairing=invitation))
+            os.replace(staged.name, target)
+            try:
+                install_cli()
+            except BaseException:
+                if os.path.lexists(previous):
+                    os.replace(previous, target)
+                else:
+                    target.unlink()
+                raise
+    return code
 
 
 def add_tool_paths():
@@ -367,26 +416,29 @@ def install(args, terminal=None, preflight_dir=None, interactive=False):
         install_in_directory(args, terminal, preflight_dir is not None, interactive, state)
 
 
+def run_checklist(flags, interaction, state):
+    script = helper_source("python-runtime.sh", "prerequisites.sh", "doctor.sh") + b'\ntermlo_doctor "$@"\n'
+    result = subprocess.run(["/bin/sh", "-s", "--", str(Path(__file__).parent),
+                             helper_source("mutagen-releases.txt").decode(), str(OS_RELEASE), state,
+                             interaction, *flags], input=script)
+    if result.returncode:
+        raise ValueError("安装前体检未通过。")
+
+
 def install_in_directory(args, terminal, checked, interactive, state):
     if not checked:
         flags = []
         for name in ("host", "port", "host_key", "name"):
             value = getattr(args, name)
             if value is not None:
-                flags.extend(["--" + name.replace("_", "-"), str(value)])
+                flags.append("--" + name.replace("_", "-") + "=" + str(value))
         if args.sync_only:
             flags.append("--sync-only")
         if args.claude is not None:
             flags.append("--with-claude" if args.claude else "--without-claude")
         if getattr(args, "check", False):
             flags.append("--check")
-        check_script = helper_source("python-runtime.sh", "prerequisites.sh", "doctor.sh") + b'\ntermlo_doctor "$@"\n'
-        check_result = subprocess.run(["/bin/sh", "-s", "--", str(Path(__file__).parent),
-                                       helper_source("mutagen-releases.txt").decode(), str(OS_RELEASE), state,
-                                       str(int(interactive)), *flags],
-                                      input=check_script)
-        if check_result.returncode:
-            raise ValueError("安装前体检未通过。")
+        run_checklist(flags, "supplied" if terminal is not None else str(int(interactive)), state)
     if getattr(args, "check", False):
         return
     region, egress = install_network()
@@ -399,7 +451,9 @@ def install_in_directory(args, terminal, checked, interactive, state):
         channels = {"cn": "中国大陆，按系统选择可用软件源", "global": "海外，优先使用系统源和官方源",
                     "auto": "未识别到出口地区，优先使用系统源"}
         note("下载线路：" + channels[region])
-        settings = connection_settings(args, terminal, region, egress)
+        listener = Path(state) / "ssh-port"
+        detected_port = wizard.ssh_port(listener.read_text().strip()) if listener.is_file() else None
+        settings = connection_settings(args, terminal, region, egress, detected_port=detected_port)
         receipt = uninstall.Receipt(folder)
         receipt.save()
         packages = SystemPackages(region, state, receipt)
@@ -426,11 +480,7 @@ def install_in_directory(args, terminal, checked, interactive, state):
                     ensure_claude(packages)
                 except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
                     optional_failure = error
-        install_cli()
-        with tempfile.NamedTemporaryFile(dir=folder, mode="w", encoding="utf-8", delete=False) as out:
-            json.dump(settings, out, ensure_ascii=False)
-        os.replace(out.name, folder / "connection.json")
-        code = encode(dict(details, version=2, pairing=pairing.issue()))
+        code = publish_connection(folder, settings, details)
     if terminal is not None:
         note("\n3/3  复制连接码")
     note("在这台远程设备上卸载可运行 ~/.local/bin/termlo uninstall")
@@ -449,10 +499,7 @@ def add_endpoint_options(parser):
     parser.add_argument("--host-key", help="sshd 使用的主机公钥文件（.pub）")
 
 
-def main(preflight_dir=None):
-    parser = argparse.ArgumentParser(prog="termlo", description=__doc__)
-    commands = parser.add_subparsers(dest="command", required=True)
-    setup = commands.add_parser("install", help="安装或更新当前用户的远程开发环境")
+def add_install_options(setup):
     add_endpoint_options(setup)
     setup.add_argument("--check", action="store_true", help="仅显示安装前体检清单")
     mode = setup.add_mutually_exclusive_group()
@@ -461,6 +508,21 @@ def main(preflight_dir=None):
                       help="安装全部基础工具，跳过 Claude Code")
     mode.add_argument("--with-claude", dest="claude", action="store_true", default=None,
                       help="安装全部基础工具和 Claude Code")
+
+
+def preflight_port(arguments, interaction):
+    parser = argparse.ArgumentParser(prog="sh install.sh", add_help=False, allow_abbrev=False)
+    add_install_options(parser)
+    args = parser.parse_args(arguments)
+    settings = connection_settings(args, prompt_later=interaction != "0" or args.check)
+    return settings["local_port"]
+
+
+def main(preflight_dir=None):
+    parser = argparse.ArgumentParser(prog="termlo", description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    setup = commands.add_parser("install", help="安装或更新当前用户的远程开发环境")
+    add_install_options(setup)
     removal = commands.add_parser("uninstall", help="卸载当前账号的 Termlo，撤销配对并移除安装器新增的工具")
     removal.add_argument("--keep-tools", action="store_true", help="保留开发工具、浏览器和同步代理")
     add_endpoint_options(commands.add_parser("connection-code", help="生成可绑定一台 Mac 的新连接码"))
@@ -469,9 +531,14 @@ def main(preflight_dir=None):
     login = commands.add_parser("browser", help="临时打开或关闭 Claude 登录浏览器")
     login.add_argument("action", choices=["start", "stop", "check"], help="check 启动原生浏览器并验证页面渲染")
     login.add_argument("--session", type=browser.session_id, help="由 Mac 客户端分配的会话 UUID")
-    args = parser.parse_args()
     try:
-        with uninstall.account_lock(exclusive=args.command == "uninstall"):
+        with ExitStack() as contexts:
+            if preflight_dir is None and sys.argv[1:2] == ["install"] and not {"-h", "--help"}.intersection(sys.argv[2:]):
+                add_tool_paths()
+                preflight_dir = contexts.enter_context(tempfile.TemporaryDirectory(prefix="termlo-install-"))
+                run_checklist(sys.argv[2:], str(int(len(sys.argv) == 2)), preflight_dir)
+            args = parser.parse_args()
+            contexts.enter_context(uninstall.account_lock(exclusive=args.command == "uninstall"))
             # A command loaded from the zipapp may have waited for removal to finish.
             if args.command != "uninstall" and not Path(sys.argv[0]).exists():
                 raise ValueError("此账号的 Termlo 已卸载。")
@@ -490,8 +557,11 @@ def dispatch(args, preflight_dir=None):
         uninstall.run(config_dir(), args.keep_tools)
     elif args.command == "connection-code":
         add_tool_paths()
-        details = verified_identity(connection_settings(args), require_key=args.host_key is not None)
-        print(encode(dict(details, version=2, pairing=pairing.issue())))
+        with pairing.locked_authorized_keys() as keys:
+            details = verified_identity(connection_settings(args), require_key=args.host_key is not None)
+            with pairing.pending_invitation(keys) as invitation:
+                code = encode(dict(details, version=2, pairing=invitation))
+        print(code)
     elif args.command == "redeem":
         print(pairing.redeem(args.ticket, os.environ.get("SSH_ORIGINAL_COMMAND", "")))
     elif args.action == "check":

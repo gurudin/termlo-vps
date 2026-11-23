@@ -108,7 +108,8 @@ def revoke_all():
     return count
 
 
-def issue():
+@contextmanager
+def pending_invitation(locked_keys):
     with tempfile.TemporaryDirectory() as temp:
         key = Path(temp) / "invite"
         subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "", "-f", str(key)],
@@ -117,15 +118,30 @@ def issue():
         private = key.read_text(encoding="ascii")
     ticket = secrets.token_hex(16)
     command = binding_command(ticket)
-    with locked_authorized_keys() as (path, lines):
-        now = int(time.time())
-        expires = now + LIFETIME
-        deadline = time.strftime("%Y%m%d%H%M%S", time.localtime(expires))
-        options = f'restrict,expiry-time="{deadline}",command="{command}"'
-        marker = f"termlo-pair:{ticket}:{expires}"
-        live = [line for line in lines if not (match := invitation_entry(line)) or int(match[3]) > now]
-        write_keys(path, live, options.encode() + b" " + public + b" " + marker.encode())
-    return dict(expiresAt=expires, key=private)
+    path, lines = locked_keys
+    now = int(time.time())
+    expires = now + LIFETIME
+    deadline = time.strftime("%Y%m%d%H%M%S", time.localtime(expires))
+    options = f'restrict,expiry-time="{deadline}",command="{command}"'
+    marker = f"termlo-pair:{ticket}:{expires}"
+    live = [line for line in lines if not ((match := invitation_entry(line))
+            and int(match[3]) <= now and managed_key(line))]
+    existed = path.exists()
+    write_keys(path, live, options.encode() + b" " + public + b" " + marker.encode())
+    try:
+        yield dict(expiresAt=expires, key=private)
+    except BaseException:
+        # No other Termlo writer can enroll a Mac between issuance and rollback.
+        if existed:
+            write_keys(path, lines, None)
+        else:
+            path.unlink()
+        raise
+
+
+def issue():
+    with locked_authorized_keys() as keys, pending_invitation(keys) as invitation:
+        return invitation
 
 
 def redeem(ticket, request):

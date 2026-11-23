@@ -1,6 +1,13 @@
 # POSIX helpers shared by the installer, its read-only checks and the installed CLI.
 has() { command -v "$1" >/dev/null 2>&1; }
 
+rpm_manager() (
+    for tool in dnf yum microdnf; do
+        if "$tool" --version >/dev/null 2>&1; then printf '%s\n' "$tool"; return 0; fi
+    done
+    return 1
+)
+
 linux_manager() (
     if [ -r "${1:-/etc/os-release}" ]; then
         . "${1:-/etc/os-release}"

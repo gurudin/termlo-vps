@@ -27,10 +27,16 @@ def validate_host(host):
     return host
 
 
+def validate_user(user):
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*\$?", user):
+        raise ValueError("请使用 Termlo 能识别的 SSH 用户名，首字符为字母或下划线。")
+
+
 def connection_details(host, port, user, host_key=None, name=None, include_host_key=False, public_key=None):
     validate_host(host)
-    if not 1 <= port <= 65535 or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*\$?", user):
-        raise ValueError("请核对 SSH 端口和用户名")
+    validate_user(user)
+    if not 1 <= port <= 65535:
+        raise ValueError("请核对 SSH 端口")
     if name is not None and not name.strip():
         raise ValueError("服务器名称不能为空")
 

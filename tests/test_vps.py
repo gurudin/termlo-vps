@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 import uuid
@@ -103,9 +104,10 @@ class InstallerTests(unittest.TestCase):
 
     def test_nat_and_console_require_reachable_host_before_install(self):
         for ssh in ("", "10.0.0.1 54000 10.1.0.2 22"):
-            with patch.dict(os.environ, SSH_CONNECTION=ssh), self.assertRaisesRegex(ValueError, "--host"):
+            with patch.dict(os.environ, SSH_CONNECTION=ssh), self.assertRaisesRegex(ValueError, "体检未通过"):
                 self.install(host=None)
         self.assertFalse(self.cli.exists())
+        self.assertFalse(termlo.config_dir().exists())
         with patch.dict(os.environ, SSH_CONNECTION="10.0.0.1 54000 2606:4700:4700::1111 2222"):
             payload = self.decode(self.install(host=None, port=None))
         self.assertEqual((payload["host"], payload["port"]), ("2606:4700:4700::1111", 2222))
@@ -117,6 +119,57 @@ class InstallerTests(unittest.TestCase):
                 self.install(**override)
         self.assertEqual(self.decode(subprocess.check_output([str(self.cli), "connection-code"], text=True)), self.decode(code))
 
+    def test_late_reinstall_failures_preserve_previous_command_settings_and_authorizations(self):
+        old = self.decode(self.install())
+        cfg = termlo.config_dir() / "connection.json"
+        keys = self.home / ".ssh/authorized_keys"
+        paths = (self.cli, cfg, keys)
+        before = [p.read_bytes() for p in paths]
+        replace = os.replace
+        for target in paths:
+            def fail(source, destination):
+                if Path(destination).resolve() == target.resolve():
+                    raise OSError("injected write failure")
+                return replace(source, destination)
+            with self.subTest(target=target), patch.object(os, "replace", side_effect=fail):
+                with self.assertRaisesRegex(OSError, "injected write failure"):
+                    self.install(host="changed.example", name="更新")
+            self.assertTrue(all(p.read_bytes() == data for p, data in zip(paths, before)))
+        self.assertEqual(self.decode(subprocess.check_output([str(self.cli), "connection-code"], text=True)), old)
+
+    def test_concurrent_connection_code_uses_the_committed_settings_after_reinstall_fails(self):
+        old = self.decode(self.install())
+        marker = self.home / "waiting-for-pair-lock"
+        with (self.bin / "sitecustomize.py").open("a") as hooks:
+            hooks.write("""
+import fcntl
+from pathlib import Path
+flock = fcntl.flock
+def trace_lock(file, operation):
+    if operation == fcntl.LOCK_EX:
+        (Path.home() / "waiting-for-pair-lock").touch()
+    return flock(file, operation)
+fcntl.flock = trace_lock
+""")
+        def fail_while_reissuing():
+            self.reader = subprocess.Popen([str(self.cli), "connection-code"], text=True,
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            deadline = time.monotonic() + 10
+            while not marker.exists() and time.monotonic() < deadline and self.reader.poll() is None:
+                time.sleep(0.02)
+            if not marker.exists():
+                self.reader.kill()
+                self.reader.communicate()
+                self.fail("Reissuance never reached the pairing lock")
+            raise OSError("interrupted publication")
+
+        with patch.object(termlo, "install_cli", side_effect=fail_while_reissuing):
+            with self.assertRaisesRegex(OSError, "interrupted publication"):
+                self.install(host="uncommitted.example")
+        output, error = self.reader.communicate(timeout=10)
+        self.assertEqual(self.reader.returncode, 0, error)
+        self.assertEqual(self.decode(output), old)
+
     def test_default_pin_uses_a_local_key_actually_offered_by_sshd(self):
         offered = self.home / "ssh_host_ecdsa_key"
         subprocess.run(["ssh-keygen", "-q", "-t", "ecdsa", "-N", "", "-f", str(offered)], check=True)
@@ -126,6 +179,30 @@ class InstallerTests(unittest.TestCase):
             code = self.install(host_key=None)
         pin = subprocess.check_output(["ssh-keygen", "-lf", str(offered) + ".pub"], text=True).split()[1]
         self.assertEqual(self.decode(code)["fingerprint"], pin)
+
+    def test_port_discovered_after_first_sshd_start_is_used_unless_user_sets_public_port(self):
+        (self.bin / "awk").symlink_to("/usr/bin/awk")
+        command(self.bin / "sshd", 'echo "port 2248"')
+        command(self.bin / "sudo", '[ "$1 $2" = "-n true" ]')
+        command(self.bin / "ssh-keyscan",
+                '[ -f "$HOME/up" ] && [ "$4" = 2248 ] || exit 1; printf "host "; cat "$HOME/ssh host key.pub"')
+        helper = termlo.shell_helper
+
+        def start_daemon(name, *args, **kwargs):
+            if name == "prepare_sshd":
+                (self.home / "up").touch()
+                return subprocess.CompletedProcess([], 0)
+            return helper(name, *args, **kwargs)
+
+        with patch.object(termlo, "shell_helper", side_effect=start_daemon):
+            for answers, expected in ((None, 2248), ("\n\n", 2248), ("\n22\n", 22)):
+                terminal = io.StringIO(answers) if answers is not None else None
+                settings = termlo.config_dir() / "connection.json"
+                settings.unlink(missing_ok=True)
+                (self.home / "up").unlink(missing_ok=True)
+                code = self.install(port=None, host_key=None, terminal=terminal)
+                self.assertEqual(self.decode(code)["port"], expected)
+                self.assertEqual(json.loads(settings.read_text())["local_port"], 2248)
 
     def prepare_fake_linux_tools(self):
         command(self.bin / "sudo", '[ "$1" != -n ] || shift; [ "$1" != true ] || exit 0; exec "$@"')

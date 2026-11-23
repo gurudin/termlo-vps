@@ -71,3 +71,15 @@ class PairingTests(unittest.TestCase):
             pairing.issue()
         self.assertNotIn(ticket.encode(), self.keys.read_bytes())
         self.assertTrue(self.keys.read_bytes().startswith(self.existing))
+
+    def test_expiry_cleanup_preserves_key_lines_with_custom_commands(self):
+        invite, _ = self.issue()
+        issued = self.keys.read_bytes().splitlines(keepends=True)[-1]
+        custom = issued.replace(b" redeem ", b" my-command ")
+        with self.keys.open("ab") as stream:
+            stream.write(custom)
+        with patch.object(pairing.time, "time", return_value=invite["expiresAt"]):
+            pairing.issue()
+        lines = self.keys.read_bytes().splitlines(keepends=True)
+        self.assertIn(custom, lines)
+        self.assertNotIn(issued, lines)

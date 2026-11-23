@@ -8,7 +8,7 @@ import sys
 import unittest
 from unittest.mock import patch
 
-from test_stream_install import INSTALL_COMMAND, StreamInstallTests as _Stream
+from test_stream_install import INSTALL_COMMAND, StreamInstallTests as _Stream, endpoint
 from test_vps import command
 import native_browser
 
@@ -136,6 +136,78 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(connection.read_text(), "[]")
         self.assertEqual(receipt.read_text(), "{")
         self.assertFalse((config / "install.lock").exists())
+
+    def test_invalid_options_and_missing_noninteractive_host_stop_at_the_checklist(self):
+        self.env.pop("SSH_CONNECTION")
+        config = self.home / "config/termlo"
+        before = (config / "connection.json").read_bytes()
+        for args, hint in (
+                (("--sync-only",), "--host"),
+                (("--host", "bad host"), "域名或 IP"),
+                (("--host", "valid.host", "--name", "  "), "名称不能为空"),
+                (("--check", "--sync-only", "--with-claude"), "--with-claude"),
+                (("--host", "--check"), "缺少值")):
+            with self.subTest(args=args):
+                result = self.run_installer(*args)
+                self.assert_checklist(result)
+                self.assertIn(hint, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual((config / "connection.json").read_bytes(), before)
+                self.assertFalse((config / "install.lock").exists())
+                self.assertFalse((self.home / ".ssh").exists())
+        self.assertEqual(self.run_installer("--check").returncode, 0)
+
+    def test_installed_reinstaller_reports_invalid_options_alongside_other_blockers(self):
+        first = self.run_installer("--sync-only")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        keys = self.home / ".ssh/authorized_keys"
+        before = keys.read_bytes()
+        command(self.home / "bin/ssh-keyscan", "exit 1")
+        result = subprocess.run([str(self.home / ".local/bin/termlo"), "install", "--check",
+                                 "--sync-only", "--with-claude"], env=self.env, capture_output=True, text=True)
+        self.assert_checklist(result)
+        self.assertIn("--with-claude", result.stderr)
+        self.assertIn("[未通过] 当前 SSH 会话", result.stderr)
+        self.assertEqual(keys.read_bytes(), before)
+
+    def test_console_uses_detected_listener_and_preserves_explicit_nat_port(self):
+        self.env.pop("SSH_CONNECTION")
+        tools = self.home / "bin"
+        (tools / "awk").symlink_to(shutil.which("awk"))
+        command(tools / "sshd", 'echo "port 2248"')
+        command(tools / "ssh-keyscan", '[ "$4" = 2248 ] || exit 1; printf "host "; cat "$HOME/host_key.pub"')
+        for flags, public in (([], 2248), (["--port", "4443"], 4443), ([], 4443)):
+            result = self.run_installer("--sync-only", "--host", "dev.example", *flags)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(endpoint(result.stdout)["port"], public)
+            self.assertEqual(json.loads((self.home / "config/termlo/connection.json").read_text())["local_port"], 2248)
+
+    def test_nested_receipt_errors_block_the_installer_before_writes(self):
+        config = self.home / "config/termlo"
+        receipt = config / "installed-components.json"
+        for malformed in ({"packages": {"apt": "tmux"}}, {"agents": {"bad": "x"}},
+                          {"claude": {"versions": 3}}, {"browserUser": {"uid": True, "gid": 10}}):
+            saved = dict({"version": 1, "packages": {}, "agents": {}}, **malformed)
+            receipt.write_text(json.dumps(saved))
+            result = self.run_installer("--sync-only")
+            self.assert_checklist(result)
+            self.assertIn("[未通过] 已有文件 installed-components.json", result.stderr)
+            self.assertFalse((config / "install.lock").exists())
+            self.assertEqual(json.loads(receipt.read_text()), saved)
+
+    def test_cli_runs_with_spaced_python_path_and_after_virtualenv_moves(self):
+        venv = self.home / "Developer's Tools"
+        subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(venv)], check=True)
+        self.env["PATH"] = str(venv / "bin") + os.pathsep + self.env["PATH"]
+        installed = self.run_installer("--sync-only")
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        cli = str(self.home / ".local/bin/termlo")
+        for move in (False, True):
+            if move:
+                venv.rename(self.home / "moved environment")
+            result = subprocess.run([cli, "connection-code"], env=self.env, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(endpoint(result.stdout), endpoint(installed.stdout))
 
     def test_empty_apt_indexes_are_resolved_in_private_storage(self):
         tools = self.home / "bin"

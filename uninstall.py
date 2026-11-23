@@ -31,6 +31,7 @@ PACKAGES = {
     "snap": {"chromium"},
 }
 VERSION_NAME = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.+-]+)?")
+SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 def note(message):
@@ -144,9 +145,47 @@ class Receipt:
             if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
                 raise ValueError("安装记录的所有者或权限异常，请核对 installed-components.json。")
             saved = json.loads(self.path.read_text(encoding="utf-8"))
-            if not isinstance(saved, dict) or saved.get("version") != 1 or not isinstance(saved.get("packages"), dict) or not isinstance(saved.get("agents"), dict):
-                raise ValueError("无法识别安装记录，请核对 installed-components.json。")
+            self.validate(saved)
             self.data = saved
+
+    @staticmethod
+    def validate(saved):
+        if (not isinstance(saved, dict) or type(saved.get("version")) is not int or saved["version"] != 1
+                or not isinstance(saved.get("packages"), dict) or not isinstance(saved.get("agents"), dict)):
+            raise ValueError("无法识别安装记录，请核对 installed-components.json。")
+        for family, names in saved["packages"].items():
+            if (family not in PACKAGES or not isinstance(names, list)
+                    or any(not isinstance(name, str) or name not in PACKAGES[family] for name in names)):
+                raise ValueError(f"请核对安装记录 packages.{family} 中的软件包列表。")
+        for filename, checksum in saved["agents"].items():
+            path = Path(filename)
+            if (not path.is_absolute() or "\x00" in filename or path.name != "mutagen-agent"
+                    or not VERSION_NAME.fullmatch(path.parent.name) or path.parent.parent.name != "agents"
+                    or not isinstance(checksum, str) or not SHA256.fullmatch(checksum)):
+                raise ValueError("请核对安装记录 agents 中的代理路径和 SHA-256。")
+        if "claude" in saved:
+            entry = saved["claude"]
+            if not isinstance(entry, dict):
+                raise ValueError("请核对安装记录中的 claude。")
+            if "sha256" in entry or "versions" not in entry:
+                if not isinstance(entry.get("sha256"), str) or not SHA256.fullmatch(entry["sha256"]):
+                    raise ValueError("请核对 Claude Code 安装记录的 SHA-256。")
+            if "versions" in entry:
+                folder = Path(entry["versions"]) if isinstance(entry["versions"], str) else None
+                if (not folder or not folder.is_absolute() or "\x00" in str(folder) or folder.parts[-2:] != ("claude", "versions")
+                        or not isinstance(entry.get("target"), str) or not VERSION_NAME.fullmatch(entry["target"])):
+                    raise ValueError("请核对 Claude Code 安装记录的程序目录和版本。")
+            if "directoryID" in entry:
+                identity = entry["directoryID"]
+                if not isinstance(identity, list) or len(identity) != 2 or any(type(n) is not int or n < 0 for n in identity):
+                    raise ValueError("请核对 Claude Code 安装记录的目录标识。")
+        if "browserUser" in saved:
+            entry = saved["browserUser"]
+            if not isinstance(entry, dict) or any(type(entry.get(key)) is not int or entry[key] <= 0 for key in ("uid", "gid")):
+                raise ValueError("请核对安装记录 browserUser 中的账号和组。")
+            stamp = entry.get("homeStamp")
+            if stamp is not None and (not isinstance(stamp, str) or not SHA256.fullmatch(stamp)):
+                raise ValueError("请核对安装记录 browserUser 中的主目录标识。")
 
     def save(self):
         with tempfile.NamedTemporaryFile(mode="w", dir=self.path.parent, delete=False, encoding="utf-8") as stream:
