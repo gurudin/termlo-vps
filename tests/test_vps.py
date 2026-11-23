@@ -48,9 +48,12 @@ class InstallerTests(unittest.TestCase):
         platform = patch.object(sys, "platform", "linux")
         platform.start()
         self.addCleanup(platform.stop)
-        for name in ("env", "bash", "ssh", "ssh-keygen", "scp", "mkdir", "mktemp", "rm", "cp", "cat", "chmod", "touch", "sh"):
+        for name in ("env", "bash", "id", "dirname", "ssh", "ssh-keygen", "scp", "mkdir", "mktemp", "rm", "cp", "cat", "chmod", "touch", "sh"):
             (self.bin / name).symlink_to(shutil.which(name, path="/usr/bin:/bin"))
         (self.bin / "python3").symlink_to(sys.executable)
+        command(self.bin / "uname", 'case "$1" in -s) echo Linux ;; -m) echo x86_64 ;; esac')
+        command(self.bin / "apt-get", 'test "$1" = --version')
+        command(self.bin / "ssh-keyscan", 'printf "host "; cat "$HOME/ssh host key.pub"')
         command(self.bin / "curl", 'test "$1" = --version')
         agent = sync_agent.installed_path()
         agent.parent.mkdir(parents=True)
@@ -117,13 +120,13 @@ class InstallerTests(unittest.TestCase):
         subprocess.run(["ssh-keygen", "-q", "-t", "ecdsa", "-N", "", "-f", str(offered)], check=True)
         shutil.copyfile(self.public, self.home / "ssh_host_ed25519_key.pub")
         command(self.bin / "ssh-keyscan", 'printf "host "; cat "$HOME/ssh_host_ecdsa_key.pub"')
-        with patch.object(termlo, "SSH_KEY_DIRECTORY", self.home), patch.dict(os.environ, SSH_CONNECTION="10.0.0.1 53900 10.1.0.2 22"):
+        with patch.dict(os.environ, SSH_CONNECTION="10.0.0.1 53900 10.1.0.2 22"):
             code = self.install(host_key=None)
         pin = subprocess.check_output(["ssh-keygen", "-lf", str(offered) + ".pub"], text=True).split()[1]
         self.assertEqual(self.decode(code)["fingerprint"], pin)
 
     def prepare_fake_linux_tools(self):
-        command(self.bin / "sudo", 'exec "$@"')
+        command(self.bin / "sudo", '[ "$1" != -n ] || shift; [ "$1" != true ] || exit 0; exec "$@"')
         for name in ("tmux", "git", "adb", "claude"):
             command(self.home / name, 'exit 0')
         command(self.home / "chromium", '''
@@ -131,6 +134,7 @@ case " $* " in *" --no-sandbox "*) exit 1 ;; *" --dump-dom "*) ;; *) exit 1 ;; e
 test ! -e "$HOME/fail-browser"
 echo '<html><head><title>termlo-browser-ready</title></head></html>' ''')
         command(self.bin / "apt-get", '''
+[ "$1" != --version ] || exit 0
 echo "apt $*" >> "$EVENTS"
 case " $* " in *" --download-only "*) exit 0 ;; esac
 if [ "$1" = install ]; then
@@ -165,7 +169,7 @@ SH''')
         events = self.events.read_text()
         for name in ("git", "tmux", "adb", "chromium"):
             self.assertIn(name, events)
-        self.assertEqual(events.count("claude\n"), 1)
+        self.assertNotIn("claude\n", events)
         self.assertNotIn("podman", events)
         self.assertEqual(self.decode(self.install(sync_only=False, host=None, port=None, host_key=None, name=None)), self.decode(code))
         self.assertEqual(self.events.read_text(), events)
@@ -216,6 +220,7 @@ SH''')
         self.assertEqual(self.events.read_text().splitlines(), ["https://claude.ai/install.sh"])
 
     def test_wizard_cancel_preserves_saved_config(self):
+        self.prepare_fake_linux_tools()
         original = self.install()
         with self.assertRaises(EOFError):
             self.wizard_install("other.example.org\n")

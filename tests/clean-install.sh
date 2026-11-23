@@ -15,19 +15,31 @@ case "$ID" in
     debian)
         apt-get update
         DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssh-server
-        mv /usr/bin/apt-get "$work/original-apt-get" ;;
-    rocky) dnf -y install openssh-server ;;
-    alpine) apk add --no-cache openssh-server openssh-keygen ;;
+        mv /usr/bin/apt-get "$work/original-apt-get"
+        # Exercise ssh-keygen on a host with sshd installed but no identity.
+        mkdir original-keys
+        for key in /etc/ssh/ssh_host_*_key*; do [ ! -f "$key" ] || mv "$key" original-keys/; done ;;
+    alpine)
+        # No Bash, Python, sshd, or pre-generated SSH identity.
+        test ! -x /usr/sbin/sshd ;;
+    rocky) : ;;  # The cloud guest is already connected over its stock SSH service.
     *) exit 1 ;;
 esac
-mkdir -p /run/sshd
-ssh-keygen -A
-# The test SSH service accepts keys on container loopback only.
+if [ "$ID" != rocky ]; then
+    # Restrict this disposable test's SSH listener to loopback.
+    mkdir -p /etc/ssh
+    cat > /etc/ssh/sshd_config <<'SSH'
+ListenAddress 127.0.0.1
+PermitRootLogin prohibit-password
+PasswordAuthentication no
+Subsystem sftp internal-sftp
+SSH
+    test ! -e /etc/ssh/ssh_host_ed25519_key
+fi
 sed -i 's|^root:[^:]*:|root:*:|' /etc/shadow
-/usr/sbin/sshd -e -o ListenAddress=127.0.0.1 -p 2222 -o PasswordAuthentication=no -o PermitRootLogin=prohibit-password
 
 install_termlo() {
-    cat /src/install.sh | sh -s -- --without-claude --host 127.0.0.1 --port 2222 > "$work/code"
+    sh /src/install.sh --without-claude --host 127.0.0.1 --port 22 > "$work/code"
 }
 
 # Stop before pairing with a real truncated transfer, then repeat the same entry point.
@@ -37,8 +49,13 @@ if install_termlo 2>first-install.log; then echo "Unexpected success with an inc
 grep -q '校验失败' first-install.log || { cat first-install.log >&2; exit 1; }
 test ! -s code
 test ! -e "$HOME/.local/bin/termlo"
+test ! -f "$HOME/.config/termlo/installed-components.json"
+if [ "$ID" != rocky ]; then test ! -e /etc/ssh/ssh_host_ed25519_key; fi
 unset TERMLO_MUTAGEN_ARCHIVE
+sh /src/install.sh --check --host 127.0.0.1
+if [ "$ID" != rocky ]; then test ! -e /etc/ssh/ssh_host_ed25519_key; fi
 install_termlo
+test -s /etc/ssh/ssh_host_ed25519_key
 "$HOME/.local/bin/termlo" browser check
 
 ssh-keygen -q -t ed25519 -N '' -f device
@@ -47,15 +64,15 @@ import base64, json
 from pathlib import Path
 raw = Path("code").read_text().strip().split("/")[-1]
 server = json.loads(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)))
-assert server["host"] == "127.0.0.1" and server["port"] == 2222
+assert server["host"] == "127.0.0.1" and server["port"] == 22
 Path("invite").write_text(server["pairing"]["key"])
-Path("known_hosts").write_text("[127.0.0.1]:2222 " + server["hostKey"] + "\n")
+Path("known_hosts").write_text("127.0.0.1 " + server["hostKey"] + "\n")
 PY
 mkdir -p "$HOME/.ssh"
 cat > "$HOME/.ssh/config" <<EOF
 Host termlo-test
   HostName 127.0.0.1
-  Port 2222
+  Port 22
   User root
   IdentityFile "$work/device"
   IdentitiesOnly yes

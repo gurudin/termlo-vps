@@ -7,12 +7,13 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 
 
 ROOT_BROWSER_USER = "termlo-browser"
 
 
-def executable():
+def candidates():
     if sys.platform == "darwin":
         apps = (("Chromium", "Chromium"), ("Google Chrome", "Google Chrome"),
                 ("Microsoft Edge", "Microsoft Edge"), ("Brave Browser", "Brave Browser"))
@@ -20,14 +21,17 @@ def executable():
             for app, binary in apps:
                 path = folder / (app + ".app") / "Contents/MacOS" / binary
                 if path.is_file() and os.access(path, os.X_OK):
-                    return str(path)
+                    yield str(path)
     for name in ("chromium", "google-chrome-stable", "google-chrome", "chromium-browser"):
         path = shutil.which(name)
         if path:
-            return path
+            yield path
     if sys.platform == "linux" and os.access("/snap/bin/chromium", os.X_OK):
-        return "/snap/bin/chromium"
-    return None
+        yield "/snap/bin/chromium"
+
+
+def executable():
+    return next(candidates(), None)
 
 
 def root_browser_account(create):
@@ -67,19 +71,33 @@ trap 'exit 1' HUP INT TERM
 
 
 def check(path=None, *, prepare_root=False):
-    path = path or executable()
-    if not path:
+    paths = list(dict.fromkeys(candidates())) if path is None else [path]
+    if not paths:
         raise ValueError("找不到原生 Chromium 或 Chrome，请重新运行 Termlo 安装器。")
-    command = ["bash", "-c", PROBE, "termlo-browser-check", path]
+    prefix = []
     if sys.platform == "linux" and os.geteuid() == 0:
         account = root_browser_account(prepare_root)
-        command = ["runuser", "-u", account.pw_name, "--", "env", "-i", "HOME=" + account.pw_dir,
-                   "USER=" + account.pw_name, "LOGNAME=" + account.pw_name,
-                   "PATH=/usr/local/bin:/usr/bin:/bin:/snap/bin", *command]
+        prefix = ["runuser", "-u", account.pw_name, "--", "env", "-i", "HOME=" + account.pw_dir,
+                  "USER=" + account.pw_name, "LOGNAME=" + account.pw_name,
+                  "PATH=/usr/local/bin:/usr/bin:/bin:/snap/bin"]
+    failures = []
+    deadline = time.monotonic() + 75
+    for index, candidate in enumerate(paths):
+        remaining = max(1, deadline - time.monotonic())
+        timeout = max(1, min(70, remaining / (len(paths) - index)))
+        try:
+            return render_page(candidate, prefix, timeout)
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            failures.append(f"{candidate}：{error}")
+    raise ValueError("已安装的浏览器均未能渲染测试页。" + "；".join(failures))
+
+
+def render_page(path, prefix, timeout):
+    command = [*prefix, "bash", "-c", PROBE, "termlo-browser-check", path]
     process = subprocess.Popen(command, cwd="/", stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                start_new_session=True, text=True, errors="replace")
     try:
-        output, errors = process.communicate(timeout=70)
+        output, errors = process.communicate(timeout=timeout)
     except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
         try:
             os.killpg(process.pid, signal.SIGTERM)

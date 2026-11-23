@@ -27,18 +27,19 @@ def validate_host(host):
     return host
 
 
-def connection_details(host, port, user, host_key, name=None, include_host_key=False):
+def connection_details(host, port, user, host_key=None, name=None, include_host_key=False, public_key=None):
     validate_host(host)
     if not 1 <= port <= 65535 or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*\$?", user):
         raise ValueError("请核对 SSH 端口和用户名")
     if name is not None and not name.strip():
         raise ValueError("服务器名称不能为空")
 
-    with Path(host_key).open(encoding="utf-8") as key_file:
-        public_key = key_file.readline()
+    if public_key is None:
+        with Path(host_key).open(encoding="utf-8") as key_file:
+            public_key = key_file.readline()
     if not public_key.startswith(("ssh-", "ecdsa-", "sk-")):
         raise ValueError("--host-key 需要 OpenSSH 格式的主机公钥")
-    result = subprocess.run(["ssh-keygen", "-E", "sha256", "-lf", "-"], input=public_key,
+    result = subprocess.run(["ssh-keygen", "-E", "sha256", "-lf", "-"], input=public_key.rstrip() + "\n",
                             capture_output=True, text=True)
     fields = result.stdout.split()
     if result.returncode or len(fields) < 2 or not re.fullmatch(r"SHA256:[A-Za-z0-9+/]{43}", fields[1]):

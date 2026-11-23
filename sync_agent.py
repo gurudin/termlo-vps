@@ -4,6 +4,7 @@ import hashlib
 import os
 from pathlib import Path
 import platform
+import pkgutil
 import shutil
 import subprocess
 import sys
@@ -11,14 +12,9 @@ import tarfile
 import tempfile
 
 
-VERSION = "0.18.1"
-# Asset IDs and SHA256SUMS from github.com/mutagen-io/mutagen/releases/tag/v0.18.1.
-RELEASES = {
-    "linux_amd64": (232224465, "7735286c778cc438418209f24d03a64f3a0151c8065ef0fe079cfaf093af6f8f"),
-    "linux_arm64": (232224500, "bcba735aebf8cbc11da9b3742118a665599ac697fa06bc5751cac8dcd540db8a"),
-    "darwin_amd64": (232224335, "7d06f7d8fcfe90bc7e55cc834a2f2f20c2e0af9ea9bc35911fc4341ad56a9bbf"),
-    "darwin_arm64": (232224354, "6f810416d9e5fc4fd5e18431146f8b3c5a2056ba5a24f76c1e66da86eb3257e2"),
-}
+# Official asset IDs and SHA-256 values, also used by the Python-free preflight.
+VERSION, *assets = pkgutil.get_data(__name__, "mutagen-releases.txt").decode("ascii").splitlines()
+RELEASES = {system: (int(asset), digest) for system, asset, digest in (line.split() for line in assets)}
 
 
 def installed_path():
@@ -38,10 +34,7 @@ def correct_version(path):
     return result.returncode == 0 and result.stdout.strip() == VERSION
 
 
-def install():
-    target = installed_path()
-    if correct_version(target):
-        return target
+def release_info():
     machine = platform.machine().lower()
     arch = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(machine)
     system = f"{sys.platform}_{arch}"
@@ -50,6 +43,24 @@ def install():
     asset, expected_digest = RELEASES[system]
     name = f"mutagen_{system}_v{VERSION}.tar.gz"
     url = f"https://github.com/mutagen-io/mutagen/releases/download/v{VERSION}/{name}"
+    api = f"https://api.github.com/repos/mutagen-io/mutagen/releases/assets/{asset}"
+    return system, expected_digest, name, url, api
+
+
+def verify_archive(path, expected_digest, name):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    if digest.hexdigest() != expected_digest:
+        raise ValueError(f"{name} 校验失败，请重新下载官方安装包。")
+
+
+def install():
+    target = installed_path()
+    if correct_version(target):
+        return target
+    system, expected_digest, name, url, api = release_info()
     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     # Stage on the destination filesystem; a failed download leaves existing agents intact.
     with tempfile.TemporaryDirectory(dir=target.parent, prefix=".install-") as tmp:
@@ -64,17 +75,11 @@ def install():
             first = subprocess.run([*download, url], stdout=sys.stderr)
             if first.returncode:
                 print("正在通过 GitHub Releases API 重试同一个官方同步包…", file=sys.stderr, flush=True)
-                api = f"https://api.github.com/repos/mutagen-io/mutagen/releases/assets/{asset}"
                 fallback = subprocess.run([*download, "-H", "Accept: application/octet-stream", api], stdout=sys.stderr)
                 if fallback.returncode and first.returncode in (60, 77):
                     first.check_returncode()
                 fallback.check_returncode()
-        digest = hashlib.sha256()
-        with archive.open("rb") as stream:
-            for block in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(block)
-        if digest.hexdigest() != expected_digest:
-            raise ValueError(f"{name} 校验失败，请重新下载官方安装包。")
+        verify_archive(archive, expected_digest, name)
         stage = folder / "mutagen-agent"
         with tarfile.open(archive, "r:gz") as release:
             bundle = release.getmember("mutagen-agents.tar.gz")

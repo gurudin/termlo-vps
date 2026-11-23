@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Used both before Python is available and by the installed Termlo command.
 set -euo pipefail
+if ! command -v linux_manager >/dev/null; then . "$(dirname -- "${BASH_SOURCE[0]}")/prerequisites.sh"; fi
 
 lookup() {
     if command -v curl >/dev/null; then
@@ -112,64 +113,6 @@ install_packages() {
         return
     done
     echo "可用的 APT 源均未能获取软件包：$*" >&2
-    return 1
-}
-
-linux_manager() (
-    local release=$1
-    if [[ -r $release ]]; then
-        . "$release"
-        case " ${ID:-} ${ID_LIKE:-} " in
-            *" debian "*|*" ubuntu "*) echo apt; return ;;
-            *" alpine "*) echo apk; return ;;
-            *" fedora "*|*" rhel "*|*" centos "*|*" alinux "*|*" amzn "*) echo rpm; return ;;
-        esac
-    fi
-    if command -v apt-get >/dev/null || command -v dpkg >/dev/null; then echo apt
-    elif command -v dnf >/dev/null || command -v yum >/dev/null || command -v microdnf >/dev/null; then echo rpm
-    elif command -v apk >/dev/null; then echo apk
-    else echo "无法识别 ${PRETTY_NAME:-当前 Linux} 的系统包管理器。" >&2; return 1
-    fi
-)
-
-as_root() {
-    if (( EUID == 0 )); then "$@"
-    elif command -v sudo >/dev/null; then sudo "$@"
-    elif command -v doas >/dev/null; then doas "$@"
-    else echo "安装系统组件需要管理员权限，当前账号无法使用 sudo 或 doas。" >&2; return 1
-    fi
-}
-
-apt_ready() {
-    command -v apt-get >/dev/null && apt-get --version >/dev/null 2>&1
-}
-
-restore_apt() {
-    apt_ready && return 0
-    if [[ -x /usr/bin/apt-get ]] && /usr/bin/apt-get --version >/dev/null 2>&1; then export PATH="/usr/bin:$PATH"; return 0; fi
-    echo "正在恢复系统的 APT 工具。" >&2
-    if command -v apt >/dev/null; then
-        if as_root apt update && as_root apt install -y --reinstall apt && apt_ready; then return 0; fi
-    fi
-    if command -v aptitude >/dev/null; then
-        if as_root aptitude update && as_root aptitude reinstall -y apt && apt_ready; then return 0; fi
-    fi
-    if command -v python3 >/dev/null && python3 -c 'import apt' 2>/dev/null; then
-        if as_root python3 -c 'import apt
-cache = apt.Cache()
-cache.update()
-cache.open(None)
-package = cache["apt"]
-if package.is_installed:
-    cache._depcache.set_reinstall(package._pkg, True)
-else:
-    package.mark_install()
-cache.commit()' && apt_ready; then return 0; fi
-    fi
-    if command -v pkcon >/dev/null; then
-        if as_root pkcon --noninteractive install apt && apt_ready; then return 0; fi
-    fi
-    echo "未能通过当前系统的软件工具恢复 apt-get。请从此发行版的签名软件源恢复 apt 软件包，再运行同一条安装命令。" >&2
     return 1
 }
 

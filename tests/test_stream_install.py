@@ -34,8 +34,12 @@ class StreamInstallTests(unittest.TestCase):
         subprocess.run(["bash", str(ROOT / "build-installer.sh"), str(self.bundle)], check=True)
         tools = self.home / "bin"
         tools.mkdir()
-        for name in ("bash", "base64", "tar", "dirname", "id", "mktemp", "rm", "ssh", "scp", "ssh-keygen"):
+        for name in ("sh", "cat", "gzip", "bash", "base64", "tar", "dirname", "id", "mktemp", "rm", "ssh", "scp", "ssh-keygen"):
             (tools / name).symlink_to(shutil.which(name))
+        (tools / "ssh-keyscan").write_text('#!/bin/sh\nprintf "host "; cat "$HOME/host_key.pub"\n')
+        (tools / "ssh-keyscan").chmod(0o755)
+        (tools / "apt-get").write_text('#!/bin/sh\ntest "$1" = --version\n')
+        (tools / "apt-get").chmod(0o755)
         (tools / "python3").symlink_to(sys.executable)
         for name in ("git", "tmux", "adb", "chromium"):
             tool = tools / name
@@ -66,7 +70,7 @@ esac
             (tools / "uname").symlink_to(shutil.which("uname"))
         else:
             # Exercise the Linux installer on the Mac development machine without installing system packages.
-            (tools / "uname").write_text("#!/bin/sh\necho Linux\n")
+            (tools / "uname").write_text('#!/bin/sh\ncase "$1" in -s) echo Linux ;; -m) echo x86_64 ;; esac\n')
             (tools / "uname").chmod(0o755)
         (tools / "sitecustomize.py").write_text("import os, sys\nsys.platform = 'linux'\nos.geteuid = lambda: 501\n")
         self.env["PYTHONPATH"] = str(tools)
@@ -178,7 +182,7 @@ esac
         tools = self.home / "bin"
         (tools / "python3").unlink()
         (tools / "env").symlink_to(shutil.which("env"))
-        (tools / "sudo").write_text('#!/bin/sh\nexec "$@"\n')
+        (tools / "sudo").write_text('#!/bin/sh\n[ "$1" != -n ] || shift; [ "$1" != true ] || exit 0; exec "$@"\n')
         (tools / "sudo").chmod(0o755)
         (tools / "apt-get").write_text("""#!/bin/sh
 echo "$*" >> "$HOME/apt-log"

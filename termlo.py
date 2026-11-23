@@ -14,6 +14,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 
 import browser
@@ -22,10 +23,9 @@ import pairing
 import sync_agent
 import uninstall
 import wizard
-from connection_code import connection_details, encode
+from connection_code import connection_details, encode, validate_host
 
 
-SSH_KEY_DIRECTORY = Path("/etc/ssh")
 OS_RELEASE = Path("/etc/os-release")
 
 
@@ -47,23 +47,56 @@ def ssh_endpoint():
     return None, 22
 
 
-def system_host_key(address, port):
-    keys = [SSH_KEY_DIRECTORY / f"ssh_host_{kind}_key.pub" for kind in ("ed25519", "ecdsa", "rsa")]
-    keys = [key for key in keys if key.is_file()]
+def helper_source(*files):
+    return b"\n".join(pkgutil.get_data("termlo", name) for name in files)
+
+
+def shell_helper(function, *args, check=True, stdout=None):
+    source = helper_source("prerequisites.sh") + ('\n' + function + ' "$@"\n').encode()
+    return subprocess.run(["/bin/sh", "-s", "--", *args], input=source, stdout=stdout, check=check)
+
+
+def verified_identity(settings, packages=None, *, require_key=False):
+    def scan():
+        probe = shell_helper("scan_ssh", str(settings["local_port"]), check=False, stdout=subprocess.PIPE)
+        return [line.split() for line in probe.stdout.decode("ascii").splitlines()] if probe.returncode == 0 else []
+
+    keys = scan()
+    if not keys and packages is not None:
+        if os.environ.get("SSH_CONNECTION"):
+            raise ValueError("当前 SSH 会话的本机端口未返回主机公钥。请用 ssh-keyscan -p 端口 本机监听地址 检查 sshd。")
+        if sys.platform == "linux" and not shutil.which("sshd"):
+            packages.install(["openssh-server"])
+        note("正在为 SSH 服务生成缺少的主机密钥并启用远程登录。")
+        repair = shell_helper("prepare_sshd", check=False, stdout=sys.stderr)
+        if repair.returncode == 0:
+            for attempt in range(8):
+                keys = scan()
+                if keys:
+                    break
+                time.sleep(0.4)
     if not keys:
-        raise ValueError("找不到 SSH 主机公钥，请用 --host-key 指定 sshd 使用的 .pub 文件。")
-    if address is not None and shutil.which("ssh-keyscan"):
-        scan = subprocess.run(["ssh-keyscan", "-T", "3", "-p", str(port), str(address)],
-                              capture_output=True, text=True, timeout=12)
-        served = {line.split()[2] for line in scan.stdout.splitlines()
-                  if not line.startswith("#") and len(line.split()) >= 3}
-        if served:
-            for key in keys:
-                fields = key.read_text().split()
-                if len(fields) >= 2 and fields[1] in served:
-                    return key
-            raise ValueError("当前 sshd 使用自定义主机密钥，请用 --host-key 指定对应的 .pub 文件。")
-    return keys[0]
+        if sys.platform == "darwin":
+            raise ValueError("SSH 尚未能接受连接。请在「系统设置 → 通用 → 共享 → 远程登录」允许当前账号，然后重试。")
+        raise ValueError("SSH 监听端口未返回公钥。运行 sudo sshd -t 检查配置，按提示修复后重试。")
+    accepted = {" ".join(row[1:]): int(row[0]) for row in keys if len(row) == 3}
+    key_file = settings.get("host_key")
+    preferred = None
+    if key_file:
+        with Path(key_file).open(encoding="utf-8") as source:
+            preferred = " ".join(source.readline().split()[:2])
+        if preferred not in accepted:
+            if require_key:
+                raise ValueError("指定的 SSH 主机公钥与服务实际提供的密钥不符。请核对 --host-key 与监听端口。")
+            settings["host_key"] = None
+            preferred = None
+    if preferred is None:
+        preferred = next((key for key in accepted if key.startswith("ssh-ed25519 ")), next(iter(accepted), None))
+    if not preferred:
+        raise ValueError("SSH 服务没有提供可验证的主机公钥。")
+    settings["local_port"] = accepted[preferred]
+    return connection_details(settings["host"], settings["port"], settings["user"], name=settings["name"],
+                              public_key=preferred, include_host_key=True)
 
 
 def connection_settings(args, terminal=None, region="global", egress=None):
@@ -85,14 +118,22 @@ def connection_settings(args, terminal=None, region="global", egress=None):
         if address is None or not address.is_global or address.is_multicast:
             raise ValueError("请用 --host 指定 Mac 可访问的 VPS 域名或 IP。有端口映射时同时指定 --port。")
         host = str(address)
-    key = args.host_key or saved.get("host_key") or system_host_key(address, internal_port)
-    return dict(host=host, port=port, user=user, host_key=str(Path(key).expanduser().resolve()),
-                name=args.name if args.name is not None else saved.get("name"))
+    validate_host(host)
+    wizard.ssh_port(str(port))
+    key = args.host_key
+    if key is None and saved.get("host_key") and Path(saved["host_key"]).is_file():
+        key = saved["host_key"]
+    name = args.name if args.name is not None else saved.get("name")
+    if name is not None and not name.strip():
+        raise ValueError("服务器名称不能为空")
+    local_port = internal_port if address is not None else saved.get("local_port", port)
+    return dict(host=host, port=port, user=user, name=name, local_port=local_port,
+                host_key=str(Path(key).expanduser().resolve()) if key else None)
 
 
 def run_sources(*args, stdout):
     # The same Bash helper bootstraps Python and travels inside the installed zipapp.
-    return subprocess.run(["bash", "-s", "--", *args], input=pkgutil.get_data("termlo", "sources.sh"),
+    return subprocess.run(["bash", "-s", "--", *args], input=helper_source("prerequisites.sh", "sources.sh"),
                           stdout=stdout, check=True)
 
 
@@ -279,7 +320,7 @@ def install_cli():
                 output.write(("#!" + sys.executable + "\n").encode())
                 with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED, strict_timestamps=False) as bundle:
                     for name in ("termlo.py", "connection_code.py", "pairing.py", "browser.py", "native_browser.py",
-                                 "sync_agent.py", "uninstall.py", "wizard.py", "sources.sh"):
+                                 "sync_agent.py", "mutagen-releases.txt", "uninstall.py", "wizard.py", "sources.sh", "doctor.sh", "prerequisites.sh", "python-runtime.sh"):
                         bundle.write(Path(__file__).with_name(name), name)
                     bundle.writestr("__main__.py", "from termlo import main\nmain()\n")
         stage.chmod(0o755)
@@ -297,29 +338,46 @@ def add_tool_paths():
         os.environ["PATH"] += ":/usr/sbin:/sbin"
 
 
-def install(args, terminal=None):
-    if sys.platform not in ("linux", "darwin"):
-        raise ValueError("请在远程 macOS 或 Linux 设备上安装 Termlo。")
-    if sys.platform == "darwin" and os.getuid() == 0:
-        raise ValueError("请用平时连接远程 Mac 的普通账号运行安装器。")
-    if os.getuid() == 0 and os.environ.get("SUDO_USER") not in (None, "", "root"):
-        raise ValueError("请用目标 SSH 账号直接运行安装器，安装系统包时会自动调用 sudo。")
+def install(args, terminal=None, checked=False):
     add_tool_paths()
+    if not checked:
+        flags = []
+        for name in ("host", "port", "host_key", "name"):
+            value = getattr(args, name)
+            if value is not None:
+                flags.extend(["--" + name.replace("_", "-"), str(value)])
+        if args.sync_only:
+            flags.append("--sync-only")
+        if args.claude is not None:
+            flags.append("--with-claude" if args.claude else "--without-claude")
+        if getattr(args, "check", False):
+            flags.append("--check")
+        os_release_env = dict(os.environ, TERMLO_DOCTOR_OS_RELEASE=str(OS_RELEASE))
+        check_script = helper_source("python-runtime.sh", "prerequisites.sh", "doctor.sh") + b'\ntermlo_doctor "$@"\n'
+        check_result = subprocess.run(["/bin/sh", "-s", "--", str(Path(__file__).parent),
+                                       helper_source("mutagen-releases.txt").decode(), *flags],
+                                      input=check_script, env=os_release_env)
+        if check_result.returncode:
+            raise ValueError("安装前体检未通过。")
+    if getattr(args, "check", False):
+        return
+    region, egress = install_network()
     folder = config_dir()
     folder.mkdir(mode=0o700, parents=True, exist_ok=True)
     with (folder / "install.lock").open("a") as lock, tempfile.TemporaryDirectory(prefix="termlo-install-") as state:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        region, egress = install_network()
         channels = {"cn": "中国大陆，按系统选择可用软件源", "global": "海外，优先使用系统源和官方源",
                     "auto": "未识别到出口地区，优先使用系统源"}
         note("下载线路：" + channels[region])
+        settings = connection_settings(args, terminal, region, egress)
         receipt = uninstall.Receipt(folder)
         receipt.save()
         packages = SystemPackages(region, state, receipt)
-        if any(not shutil.which(tool) for tool in ("ssh", "scp", "ssh-keygen")):
+        if any(not shutil.which(tool) for tool in ("ssh", "scp", "ssh-keygen", "ssh-keyscan")):
             packages.install(["openssh" if sys.platform == "darwin" else "openssh-client"])
-        settings = connection_settings(args, terminal, region, egress)
-        details = connection_details(**settings, include_host_key=True)
+        if sys.platform == "linux" and packages.family == "apt":
+            shell_helper("restore_apt", stdout=sys.stderr)
+        details = verified_identity(settings, packages, require_key=args.host_key is not None)
         note("\n2/3  准备远程开发环境")
         if not tool_works(["curl", "--version"]):
             packages.install(["curl"])
@@ -331,7 +389,7 @@ def install(args, terminal=None):
             ensure_base_tools(packages)
             if terminal is not None:
                 select_claude(terminal, packages)
-            elif args.claude is not False:
+            elif args.claude is True:
                 ensure_claude(packages)
         install_cli()
         with tempfile.NamedTemporaryFile(dir=folder, mode="w", encoding="utf-8", delete=False) as out:
@@ -353,11 +411,12 @@ def add_endpoint_options(parser):
     parser.add_argument("--host-key", help="sshd 使用的主机公钥文件（.pub）")
 
 
-def main():
+def main(checked=False):
     parser = argparse.ArgumentParser(prog="termlo", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     setup = commands.add_parser("install", help="安装或更新当前用户的远程开发环境")
     add_endpoint_options(setup)
+    setup.add_argument("--check", action="store_true", help="仅显示安装前体检清单")
     mode = setup.add_mutually_exclusive_group()
     mode.add_argument("--sync-only", action="store_true", help="仅准备 SSH 和远端同步代理")
     mode.add_argument("--without-claude", dest="claude", action="store_false", default=None,
@@ -378,28 +437,29 @@ def main():
             # A command loaded from the zipapp may have waited for removal to finish.
             if args.command != "uninstall" and not Path(sys.argv[0]).exists():
                 raise ValueError("此账号的 Termlo 已卸载。")
-            dispatch(args)
+            dispatch(args, checked)
     except (EOFError, KeyboardInterrupt):
         parser.exit(130, "\n操作已取消。\n")
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         parser.exit(1, f"Termlo：{error}\n")
 
 
-def dispatch(args):
+def dispatch(args, checked=False):
     if args.command == "install" and len(sys.argv) == 2:
         try:
             terminal = open("/dev/tty", "r", encoding="utf-8")
         except OSError:
             raise ValueError("安装向导需要交互终端。请在设备控制台或交互式 SSH 会话中运行。") from None
         with terminal:
-            install(args, terminal)
+            install(args, terminal, checked)
     elif args.command == "install":
-        install(args)
+        install(args, checked=checked)
     elif args.command == "uninstall":
         add_tool_paths()
         uninstall.run(config_dir(), args.keep_tools)
     elif args.command == "connection-code":
-        details = connection_details(**connection_settings(args), include_host_key=True)
+        add_tool_paths()
+        details = verified_identity(connection_settings(args), require_key=args.host_key is not None)
         print(encode(dict(details, version=2, pairing=pairing.issue())))
     elif args.command == "redeem":
         print(pairing.redeem(args.ticket, os.environ.get("SSH_ORIGINAL_COMMAND", "")))

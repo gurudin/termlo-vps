@@ -46,8 +46,11 @@ jobs:
         run: |
           umask 077
           ssh-keygen -q -t ed25519 -N '' -f "$RUNNER_TEMP/host-key"
+          printf 'ListenAddress 127.0.0.1\nPort 2222\nHostKey %s/host-key\nPidFile %s/sshd.pid\n' "$RUNNER_TEMP" "$RUNNER_TEMP" > "$RUNNER_TEMP/sshd_config"
+          if [ "$(uname)" = Linux ]; then sudo install -d -m 0755 /run/sshd; fi
+          sudo /usr/sbin/sshd -f "$RUNNER_TEMP/sshd_config"
           for attempt in 1 2; do
-            bash install.sh --without-claude --host 127.0.0.1 --host-key "$RUNNER_TEMP/host-key.pub" > "$RUNNER_TEMP/code"
+            sh install.sh --without-claude --host 127.0.0.1 --port 2222 > "$RUNNER_TEMP/code"
             grep -q '^termlo://connect/' "$RUNNER_TEMP/code"
           done
           "$HOME/.local/bin/termlo" browser check

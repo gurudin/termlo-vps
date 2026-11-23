@@ -9,13 +9,19 @@ compat_stage=''
 trap 'rm -f -- "$stage"; if [[ -n $compat_stage ]]; then rm -f -- "$compat_stage"; fi' EXIT
 
 cat > "$stage" <<'HEADER'
-#!/usr/bin/env bash
+#!/bin/sh
 set -eu
-(set -o pipefail) 2>/dev/null && set -o pipefail
 termlo_install() (
+for tool in mktemp base64 tar gzip cat dirname rm; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "[需处理] 安装包解压工具缺少 $tool。" >&2
+        echo "Debian/Ubuntu：apt-get install -y coreutils tar gzip；Alpine：apk add busybox tar gzip；RPM：dnf install -y coreutils tar gzip。用管理员账号执行后重试。" >&2
+        exit 1
+    fi
+done
 bundle=$(mktemp -d)
 trap 'rm -rf -- "$bundle"' EXIT
-base64 -d <<'TERMLO_ARCHIVE' | tar -xz -C "$bundle"
+base64 -d > "$bundle/archive.tgz" <<'TERMLO_ARCHIVE'
 HEADER
 python3 - "$source_dir" >> "$stage" <<'PY'
 import base64
@@ -29,8 +35,8 @@ source = Path(sys.argv[1])
 payload = io.BytesIO()
 with gzip.GzipFile(fileobj=payload, mode="wb", mtime=0) as compressed:
     with tarfile.open(fileobj=compressed, mode="w", format=tarfile.USTAR_FORMAT) as archive:
-        for name in ("bootstrap.sh", "sources.sh", "termlo.py", "connection_code.py", "pairing.py", "browser.py",
-                     "native_browser.py", "sync_agent.py", "uninstall.py", "wizard.py"):
+        for name in ("bootstrap.sh", "bootstrap.py", "python-runtime.sh", "prerequisites.sh", "doctor.sh", "sources.sh", "termlo.py", "connection_code.py", "pairing.py", "browser.py",
+                     "native_browser.py", "sync_agent.py", "mutagen-releases.txt", "uninstall.py", "wizard.py"):
             data = (source / name).read_bytes()
             member = tarfile.TarInfo(name)
             member.size = len(data)
@@ -40,25 +46,8 @@ PY
 cat >> "$stage" <<'FOOTER'
 
 TERMLO_ARCHIVE
-if ! command -v bash >/dev/null 2>&1; then
-    if command -v apk >/dev/null 2>&1; then set_bash_pkg=apk
-    elif command -v apt-get >/dev/null 2>&1; then set_bash_pkg=apt-get
-    elif command -v dnf >/dev/null 2>&1; then set_bash_pkg=dnf
-    elif command -v yum >/dev/null 2>&1; then set_bash_pkg=yum
-    else echo "当前系统缺少 Bash，也没有可用于安装它的包管理器。" >&2; exit 1; fi
-    install_bash() {
-        if [ "$(id -u)" = 0 ]; then "$@"
-        elif command -v sudo >/dev/null 2>&1; then sudo "$@"
-        elif command -v doas >/dev/null 2>&1; then doas "$@"
-        else echo "准备 Bash 需要管理员权限，当前账号无法使用 sudo 或 doas。" >&2; return 1; fi
-    }
-    case $set_bash_pkg in
-        apk) install_bash apk add --no-cache bash ;;
-        apt-get) install_bash apt-get update && install_bash apt-get install -y bash ;;
-        *) install_bash "$set_bash_pkg" -y install bash ;;
-    esac >&2
-fi
-bash "$bundle/bootstrap.sh" "$@"
+tar -xzf "$bundle/archive.tgz" -C "$bundle"
+sh "$bundle/bootstrap.sh" "$@"
 )
 termlo_install "$@"
 FOOTER
